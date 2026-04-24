@@ -1,0 +1,200 @@
+{
+  "name": "06 — Content Fan-out Multi-platform v3",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 10 }] }
+      },
+      "id": "cron-10m",
+      "name": "Every 10m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ready AS (\n  SELECT id FROM content.items\n  WHERE org_id = $1\n    AND status = 'enriched'\n    AND (enrich_result->>'keep')::boolean = true\n  ORDER BY created_at ASC\n  LIMIT 1 FOR UPDATE SKIP LOCKED\n)\nUPDATE content.items i\nSET status = 'fanning_out', locked_at = now(), updated_at = now()\nFROM ready\nWHERE i.id = ready.id\nRETURNING i.id, i.title, i.body, i.canonical_url, i.hero_image_url, i.source,\n         i.raw_payload->>'topic' AS topic,\n         i.enrich_result;",
+        "additionalFields": { "queryParams": "={{ $env.ZALOCRM_ORG_ID }}" }
+      },
+      "id": "fetch-enriched",
+      "name": "Pick enriched items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "LIMIT 1 so the downstream 1→N fan-out does not need SplitInBatches. Backlog drains via the 10-min cron. The item stays in transitional state 'fanning_out' until **every** planned platform draft has been inserted (gated by a COUNT subquery in Mark item drafted, driven by plannedCount embedded at Plan per-platform). If LLM/QA fails for one platform, item stays 'fanning_out' and is surfaced by the editorial SLA watchdog (WF 07)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Define the fan-out plan: one platform = one rewrite call.\n// Adjust platforms array per business needs.\n// NOTE: `zalo_oa` intentionally NOT listed here — Zalo OA broadcast is not\n// auto-published in v1 (see docs/12-zalo-oa-publish.md). Editorial team will\n// broadcast the Facebook/TikTok draft manually via Zalo Business dashboard\n// if needed. Re-enable once an official OA broadcast endpoint is wired.\nconst platforms = [\n  { platform: 'facebook',\n    spec: 'Facebook post VN 700-1200 ký tự, 1 hook + 3-5 hashtag.' },\n  { platform: 'tiktok',\n    spec: 'TikTok caption VN ≤150 ký tự + 5 hashtag trending. Hook 1 câu.' },\n  { platform: 'linkedin',\n    spec: 'LinkedIn post EN ≤1500 chars, professional tone, 3 hashtags.' }\n];\nconst item = $json;\n// Embed plannedCount into every child so the downstream Mark item drafted\n// node can decide whether fan-out is complete without re-reading node state.\nconst plannedCount = platforms.length;\nreturn platforms.map(p => ({ json: { ...item, ...p, plannedCount } }));"
+      },
+      "id": "plan-platforms",
+      "name": "Plan per-platform",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.LITELLM_KEY_CONTENT }}" },
+          { "name": "Content-Type",  "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"rewrite-vi\",\n  \"temperature\": 0.6,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"Bạn là copywriter cho thương hiệu Việt. Đầu ra JSON: {\\\"body\\\":\\\"...\\\",\\\"hashtags\\\":[\\\"#...\\\"]}. Không bịa số liệu, không viện dẫn nguồn không chắc.\" },\n    { \"role\": \"user\", \"content\": \"Yêu cầu: {{ $json.spec }}\\n\\nTiêu đề: {{ $json.title }}\\nNội dung gốc: {{ $json.body }}\" }\n  ]\n}",
+        "options": { "timeout": 45000, "retry": { "maxTries": 2 } }
+      },
+      "id": "rewrite",
+      "name": "Rewrite per platform",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1140, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_BASE_URL }}/skills/content_qa/execute",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"platform\": \"{{ $('Plan per-platform').item.json.platform }}\",\n  \"body\":   {{ JSON.stringify(JSON.parse($json.choices[0].message.content).body) }},\n  \"topic\":  \"{{ $('Plan per-platform').item.json.topic }}\"\n}",
+        "options": { "timeout": 30000, "retry": { "maxTries": 1 } }
+      },
+      "id": "qa",
+      "name": "content_qa (OpenClaw)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1380, 300],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const llm = JSON.parse($('Rewrite per platform').first().json.choices?.[0]?.message?.content || '{}');\nconst qa  = $json || { policyOk: true, plagiarism: 0, risk: 'low', notes: 'qa_skipped' };\nconst plan = $('Plan per-platform').item.json;\n// Plan per-platform spreads the original item into each platform record, so\n// `plan` already carries id/title/body/source/hero_image_url/canonical_url.\nconst status = qa.policyOk === false || qa.risk === 'high' ? 'rejected' : 'pending_review';\nconst scheduledAt = new Date(Date.now() + 2 * 3600 * 1000).toISOString();\nconst media = plan.hero_image_url ? [plan.hero_image_url] : [];\n// queued_at semantics: non-NULL when the draft is editor-visible.\n//   - rejected → terminal, no sheet push needed → set queued_at at INSERT time.\n//   - pending_review → set queued_at AFTER successful Push to Review Queue.\nconst queuedAt = status === 'rejected' ? new Date().toISOString() : null;\nreturn [{ json: {\n  itemId: plan.id,\n  orgId:  $env.ZALOCRM_ORG_ID,\n  platform: plan.platform,\n  variantKey: 'v1',\n  body:   llm.body || '',\n  hashtags: llm.hashtags || [],\n  media,\n  qaResult: qa,\n  status,\n  scheduledAt,\n  queuedAt,\n  title: plan.title,\n  source: plan.source,\n  canonicalUrl: plan.canonical_url\n}}];"
+      },
+      "id": "shape",
+      "name": "Shape draft + QA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO content.drafts (item_id, org_id, platform, variant_key, body, media_urls, hashtags, status, qa_result, scheduled_at, queued_at)\nVALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8, $9::jsonb, $10, $11)\nON CONFLICT (item_id, platform, variant_key) DO UPDATE\n  SET updated_at = now()\nRETURNING id, status, scheduled_at, queued_at;",
+        "additionalFields": {
+          "queryParams": "={{ $json.itemId }},={{ $json.orgId }},={{ $json.platform }},={{ $json.variantKey }},={{ $json.body }},={{ JSON.stringify($json.media) }},={{ JSON.stringify($json.hashtags) }},={{ $json.status }},={{ JSON.stringify($json.qaResult) }},={{ $json.scheduledAt }},={{ $json.queuedAt }}"
+        }
+      },
+      "id": "save",
+      "name": "Save draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1840, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "Idempotent upsert on ux_content_drafts_variant (unique on item_id, platform, variant_key). ON CONFLICT DO UPDATE SET updated_at = now() is a deliberate no-op update — it does NOT overwrite body/hashtags/status/qa_result so that editor edits in the admin UI are preserved across retries. The reason we switched away from DO NOTHING (round V) is: DO NOTHING returned 0 rows on conflict, so the downstream Draft inserted? IF could not tell the difference between 'first successful insert' and 'retry after Sheet fail with queued_at IS NULL'; the latter case was silently skipping Push to Review Queue on requeue → item stayed stuck in fanning_out forever. DO UPDATE always returns the current row, letting the next IF route on queued_at state."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.queued_at }}", "rightValue": "", "operator": { "type": "string", "operation": "empty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-needs-push",
+      "name": "Needs sheet push?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2060, 300],
+      "notesInFlow": true,
+      "notes": "Routes on queued_at NULL (editor not yet visible) vs NOT NULL (already visible OR rejected terminal).\n\n  TRUE  (queued_at IS NULL)   → Push to Review Queue → Mark draft queued → Mark item drafted\n  FALSE (queued_at IS NOT NULL)→ Mark item drafted (skip sheet push, idempotent)\n\nCovers all 4 states the retry can land in:\n  - pending_review, first insert     → queued_at NULL → push+mark\n  - pending_review, Sheet-fail retry → queued_at NULL (preserved) → push+mark (recovery path)\n  - pending_review, already queued   → queued_at set → skip (idempotent)\n  - rejected, any time               → queued_at set by Shape+QA → skip (terminal)"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": { "__rl": true, "value": "={{ $env.GOOGLE_SHEETS_REVIEW_QUEUE_ID }}", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Review Queue", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "draft_id": "={{ $json.id }}",
+            "source": "={{ $('Shape draft + QA').item.json.source }}",
+            "title": "={{ $('Shape draft + QA').item.json.title }}",
+            "canonical_url": "={{ $('Shape draft + QA').item.json.canonicalUrl }}",
+            "platform": "={{ $('Shape draft + QA').item.json.platform }}",
+            "body": "={{ $('Shape draft + QA').item.json.body }}",
+            "scheduled_at": "={{ $json.scheduled_at }}",
+            "status": "={{ $json.status }}",
+            "verdict": "approve | reject | edit"
+          },
+          "matchingColumns": ["draft_id"]
+        },
+        "options": {}
+      },
+      "id": "push-to-sheet",
+      "name": "Push to Review Queue",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [2280, 240],
+      "credentials": { "googleSheetsOAuth2Api": { "id": "gsheets-main", "name": "Google Sheets (service account)" } },
+      "notesInFlow": true,
+      "notes": "X2 (round X): operation changed append → appendOrUpdate. Why: 'append' ignores matchingColumns and blindly appends a row every time. If the Sheets API succeeds but the subsequent 'Mark draft queued' Postgres node fails, the retry loop re-enters here with queued_at=NULL and appends a SECOND row for the same draft_id — editors see duplicates. appendOrUpdate uses matchingColumns=['draft_id'] to upsert: find row by draft_id, update in place; if not found, append once. Retry now idempotent at the Sheet boundary."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.drafts\nSET queued_at = COALESCE(queued_at, now()),\n    updated_at = now()\nWHERE id = $1\nRETURNING id, queued_at;",
+        "additionalFields": { "queryParams": "={{ $('Save draft').item.json.id }}" }
+      },
+      "id": "mark-queued",
+      "name": "Mark draft queued",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2500, 240],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "Confirms the draft is editor-visible by setting queued_at=now() AFTER Push to Review Queue succeeds. If Google Sheets fails, this node never runs → queued_at stays NULL → Mark item drafted's gate excludes this draft → item stays 'fanning_out' until WF07 or manual recovery intervenes. COALESCE guards against re-runs reusing an earlier successful push timestamp."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.items i\nSET status = 'drafted', locked_at = NULL, updated_at = now()\nWHERE i.id = $1\n  AND i.status = 'fanning_out'\n  AND (\n    SELECT COUNT(*) FROM content.drafts d\n    WHERE d.item_id = i.id\n      AND d.variant_key = 'v1'\n      AND d.queued_at IS NOT NULL\n  ) >= $2::int;",
+        "additionalFields": { "queryParams": "={{ $('Plan per-platform').item.json.id }},={{ $('Plan per-platform').item.json.plannedCount }}" }
+      },
+      "id": "mark-drafted",
+      "name": "Mark item drafted",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2720, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "Fires once per platform (~3x per original item). Only the LAST invocation that actually has all plannedCount drafts with queued_at IS NOT NULL flips the item and clears locked_at. The queued_at gate makes partial failures (Google Sheets down, LLM reject, Save draft conflict) visible — item stays 'fanning_out' with locked_at still set, surfaced by WF07's stuck-item query (interval > 30m)."
+    }
+  ],
+  "connections": {
+    "Every 10m":            { "main": [[ { "node": "Pick enriched items", "type": "main", "index": 0 } ]] },
+    "Pick enriched items":  { "main": [[ { "node": "Plan per-platform", "type": "main", "index": 0 } ]] },
+    "Plan per-platform":    { "main": [[ { "node": "Rewrite per platform", "type": "main", "index": 0 } ]] },
+    "Rewrite per platform": { "main": [[ { "node": "content_qa (OpenClaw)", "type": "main", "index": 0 } ]] },
+    "content_qa (OpenClaw)":{ "main": [[ { "node": "Shape draft + QA", "type": "main", "index": 0 } ], [ { "node": "Shape draft + QA", "type": "main", "index": 0 } ]] },
+    "Shape draft + QA":     { "main": [[ { "node": "Save draft", "type": "main", "index": 0 } ]] },
+    "Save draft":           { "main": [[ { "node": "Needs sheet push?", "type": "main", "index": 0 } ]] },
+    "Needs sheet push?":    { "main": [ [ { "node": "Push to Review Queue", "type": "main", "index": 0 } ], [ { "node": "Mark item drafted", "type": "main", "index": 0 } ] ] },
+    "Push to Review Queue": { "main": [[ { "node": "Mark draft queued", "type": "main", "index": 0 } ]] },
+    "Mark draft queued":    { "main": [[ { "node": "Mark item drafted", "type": "main", "index": 0 } ]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

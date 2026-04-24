@@ -1,0 +1,113 @@
+{
+  "name": "03 — Google Sheets Review Sync v1",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 5 }] }
+      },
+      "id": "cron-5m",
+      "name": "Every 5m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": { "__rl": true, "value": "={{ $env.GOOGLE_SHEETS_REVIEW_QUEUE_ID }}", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Review Queue", "mode": "name" },
+        "filtersUI": {
+          "values": [
+            { "lookupColumn": "status", "lookupValue": "pending_review" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "read-queue",
+      "name": "Read pending rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [480, 300],
+      "credentials": { "googleSheetsOAuth2Api": { "id": "gsheets-main", "name": "Google Sheets (service account)" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Act on rows where 'verdict' cell has been edited by staff.\nreturn $input.all().filter(r => ['approve','reject','edit'].includes((r.json.verdict||'').toLowerCase().trim()));"
+      },
+      "id": "filter-verdicts",
+      "name": "Filter actionable",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "outputKey": "approve", "conditions": { "options": { "caseSensitive": false, "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.verdict }}", "rightValue": "approve", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "reject",  "conditions": { "options": { "caseSensitive": false, "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.verdict }}", "rightValue": "reject", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "edit",    "conditions": { "options": { "caseSensitive": false, "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.verdict }}", "rightValue": "edit", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } }
+          ]
+        }
+      },
+      "id": "switch-verdict",
+      "name": "Route verdict",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [940, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.drafts SET status = 'approved', updated_at = now() WHERE id = $1 AND status = 'pending_review' RETURNING id;",
+        "additionalFields": { "queryParams": "={{ $json.draft_id }}" }
+      },
+      "id": "approve",
+      "name": "Approve draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 160],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.drafts SET status = 'rejected', reject_reason = 'editor_rejected', updated_at = now() WHERE id = $1 AND status = 'pending_review' RETURNING id;",
+        "additionalFields": { "queryParams": "={{ $json.draft_id }}" }
+      },
+      "id": "reject",
+      "name": "Reject draft",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.drafts SET status = 'approved', body = COALESCE(NULLIF($2, ''), body), updated_at = now() WHERE id = $1 AND status = 'pending_review' RETURNING id;",
+        "additionalFields": { "queryParams": "={{ $json.draft_id }},={{ $json.body }}" }
+      },
+      "id": "edit",
+      "name": "Edit + approve",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1420, 440],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    }
+  ],
+  "connections": {
+    "Every 5m":           { "main": [[ { "node": "Read pending rows", "type": "main", "index": 0 } ]] },
+    "Read pending rows":  { "main": [[ { "node": "Filter actionable", "type": "main", "index": 0 } ]] },
+    "Filter actionable":  { "main": [[ { "node": "Route verdict", "type": "main", "index": 0 } ]] },
+    "Route verdict":      { "main": [
+        [ { "node": "Approve draft", "type": "main", "index": 0 } ],
+        [ { "node": "Reject draft",  "type": "main", "index": 0 } ],
+        [ { "node": "Edit + approve","type": "main", "index": 0 } ]
+    ] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

@@ -1,0 +1,81 @@
+{
+  "name": "07 — Editorial SLA + fan-out watchdog (30m)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 30 }] }
+      },
+      "id": "cron-30m",
+      "name": "Every 30m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Drafts that editors have not touched within SLA.\nSELECT id, platform, created_at, scheduled_at, left(body, 120) AS preview\nFROM content.drafts\nWHERE org_id = $1\n  AND status = 'pending_review'\n  AND queued_at IS NOT NULL                 -- only alert on drafts actually visible to editors\n  AND created_at < now() - interval '2 hours'\nORDER BY created_at ASC\nLIMIT 50;",
+        "additionalFields": { "queryParams": "={{ $env.ZALOCRM_ORG_ID }}" }
+      },
+      "id": "fetch-overdue",
+      "name": "Overdue drafts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 220],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Items locked in a transitional status for longer than 30 minutes.\n-- WF06 sets status='fanning_out' + locked_at=now() when it claims an item,\n-- and clears locked_at only when all plannedCount drafts have queued_at set.\n-- If LLM / QA / Google Sheets fails for any branch the item stays here,\n-- otherwise invisible to operators.\n-- WF08 sets status='batch_rewriting' with the same locked_at convention.\nSELECT id, status, source, title, locked_at,\n       extract(epoch FROM (now() - locked_at))::int AS stuck_seconds\nFROM content.items\nWHERE org_id = $1\n  AND status IN ('fanning_out','batch_rewriting')\n  AND locked_at IS NOT NULL\n  AND locked_at < now() - interval '30 minutes'\nORDER BY locked_at ASC\nLIMIT 50;",
+        "additionalFields": { "queryParams": "={{ $env.ZALOCRM_ORG_ID }}" }
+      },
+      "id": "fetch-stuck-items",
+      "name": "Stuck fan-out items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 380],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "Closes the dead-letter path that used to exist when an item was moved to 'fanning_out' by WF06 and then any downstream step threw. The item would never be picked up again (WF06 only claims 'enriched'). Now it surfaces here after 30 minutes so on-call can manually requeue: UPDATE content.items SET status='enriched', locked_at=NULL, updated_at=now() WHERE id='<id>'; -- or investigate root cause first."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge both query results (drafts + stuck items) into a single Telegram\n// alert. Keep the two buckets clearly labelled so on-call knows whether\n// they need to nudge editors (sheet queue) or requeue fan-out items (DB).\nconst drafts = $('Overdue drafts').all().map(x => x.json);\nconst items  = $('Stuck fan-out items').all().map(x => x.json);\nif (!drafts.length && !items.length) return [];\n\nconst fmtDraft = d => `• [${d.platform}] ${d.id} (${Math.floor((Date.now() - new Date(d.created_at).getTime())/60000)}m)`;\nconst fmtItem  = i => `• [${i.status}] ${i.id} — ${(i.title || '').slice(0,60)} (${Math.floor(i.stuck_seconds/60)}m)`;\n\nconst parts = [];\nif (drafts.length) {\n  parts.push(`*Editorial SLA breach — ${drafts.length} draft(s) > 2h*`);\n  parts.push(drafts.map(fmtDraft).join('\\n'));\n}\nif (items.length) {\n  parts.push(`*Fan-out watchdog — ${items.length} item(s) stuck > 30m*`);\n  parts.push('Requeue SQL: `UPDATE content.items SET status=\\'enriched\\', locked_at=NULL WHERE id=...`');\n  parts.push(items.map(fmtItem).join('\\n'));\n}\n\nreturn [{ json: {\n  draftCount: drafts.length,\n  stuckCount: items.length,\n  text: parts.join('\\n\\n').slice(0, 3500)\n}}];"
+      },
+      "id": "summarize",
+      "name": "Summarize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_ALERT_CHAT_ID }}\",\n  \"parse_mode\": \"Markdown\",\n  \"text\": \"{{ $json.text }}\\n\\nSheet: {{ $env.GOOGLE_SHEETS_REVIEW_QUEUE_URL }}\"\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "alert",
+      "name": "Telegram breach alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 300]
+    }
+  ],
+  "connections": {
+    "Every 30m":           { "main": [[
+        { "node": "Overdue drafts",      "type": "main", "index": 0 },
+        { "node": "Stuck fan-out items", "type": "main", "index": 0 }
+    ]] },
+    "Overdue drafts":      { "main": [[ { "node": "Summarize", "type": "main", "index": 0 } ]] },
+    "Stuck fan-out items": { "main": [[ { "node": "Summarize", "type": "main", "index": 0 } ]] },
+    "Summarize":           { "main": [[ { "node": "Telegram breach alert", "type": "main", "index": 0 } ]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

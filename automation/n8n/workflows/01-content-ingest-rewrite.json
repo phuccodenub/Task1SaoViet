@@ -1,0 +1,196 @@
+{
+  "name": "01 — Content Ingest + Guardrail v2",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 15 }]
+        }
+      },
+      "id": "cron-every-15m",
+      "name": "Every 15m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.feedUrl }}",
+        "options": { "ignoreSSL": false, "timeout": 15000 }
+      },
+      "id": "rss-read",
+      "name": "RSS Read",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [880, 300],
+      "notesInFlow": true,
+      "notes": "Reads each feed. Feed list comes from the Config node."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Feed catalogue — edit here to add/remove sources.\n// Keep list small for MVP; scale via the Scraper OpenClaw skill later.\nconst feeds = [\n  { feedUrl: 'https://tuoitre.vn/rss/kinh-doanh.rss', source: 'rss:tuoitre-kinh-doanh', topic: 'business' },\n  { feedUrl: 'https://vnexpress.net/rss/kinh-doanh.rss', source: 'rss:vnexpress-business', topic: 'business' },\n  { feedUrl: 'https://cafef.vn/thi-truong-chung-khoan.rss', source: 'rss:cafef-stock', topic: 'finance' }\n];\nreturn feeds.map(f => ({ json: f }));"
+      },
+      "id": "config-feeds",
+      "name": "Feed catalogue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300],
+      "notesInFlow": true,
+      "notes": "Emits one item per feed. RSS Read then runs once PER INPUT ITEM (built-in behavior of n8n executeOnce=false), so all 3 feeds are fetched in the same workflow run. No SplitInBatches required — removing it avoided the broken `main[0]=done/main[1]=loop` wiring plus the 1→N fan-out batch-advance bug."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Runs ONCE per RSS article. Pairs back to the originating Feed catalogue\n// entry via n8n pairedItem tracking, so each article carries the correct\n// source/topic even though RSS Read emitted a mixed stream of 3N items.\nconst crypto = require('crypto');\nconst feed   = $('Feed catalogue').item.json;\nconst it     = $json;\nconst title  = (it.title || '').trim();\nconst link   = (it.link || it.guid || '').trim();\nconst body   = (it.contentSnippet || it.description || it.content || '').trim();\nif (!title || !body) { return null; }\nconst hash = crypto.createHash('sha256')\n  .update(`${link || title}::${body.slice(0, 200)}`)\n  .digest('hex');\nreturn { json: {\n  orgId:         $env.ZALOCRM_ORG_ID,\n  source:        feed.source,\n  topic:         feed.topic,\n  canonicalUrl:  link || null,\n  title,\n  body,\n  heroImageUrl:  it.enclosure?.url || null,\n  publishedAt:   it.isoDate || it.pubDate || new Date().toISOString(),\n  dedupeHash:    hash,\n  raw:           { ...it, topic: feed.topic }\n}};"
+      },
+      "id": "normalize",
+      "name": "Normalize + hash",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO content.items (org_id, source, canonical_url, title, body, hero_image_url, published_at, dedupe_hash, raw_payload, status)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'ingested')\nON CONFLICT (org_id, dedupe_hash) DO NOTHING\nRETURNING id, title, body, source, raw_payload->>'topic' AS topic, canonical_url, hero_image_url;",
+        "additionalFields": {
+          "queryParams": "={{ $json.orgId }},={{ $json.source }},={{ $json.canonicalUrl }},={{ $json.title }},={{ $json.body }},={{ $json.heroImageUrl }},={{ $json.publishedAt }},={{ $json.dedupeHash }},={{ JSON.stringify($json.raw) }}"
+        }
+      },
+      "id": "insert-item",
+      "name": "Upsert content.items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1320, 300],
+      "credentials": {
+        "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.id }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "filter-new",
+      "name": "Only new items",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.LITELLM_KEY_CONTENT }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"guardrail\",\n  \"temperature\": 0,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"Bạn là biên tập viên. Đánh giá bài báo có phù hợp đăng fanpage doanh nghiệp không. Trả JSON: {\\\"keep\\\":true|false,\\\"reason\\\":\\\"...\\\",\\\"tone\\\":\\\"pro|neutral|casual\\\",\\\"risk\\\":\\\"low|med|high\\\",\\\"brandFit\\\":0-10}\" },\n    { \"role\": \"user\", \"content\": \"Tiêu đề: {{ $json.title }}\\nNội dung: {{ $json.body }}\" }\n  ]\n}",
+        "options": { "timeout": 30000, "retry": { "maxTries": 2 } }
+      },
+      "id": "guardrail",
+      "name": "Guardrail filter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1760, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $input.first().json.choices?.[0]?.message?.content ?? '{}';\nlet verdict; try { verdict = JSON.parse(raw); } catch { verdict = { keep: false, reason: 'parse_error', risk: 'high' }; }\nconst item = $('Upsert content.items').first().json;\nreturn [{ json: { ...item, verdict } }];"
+      },
+      "id": "parse-verdict",
+      "name": "Parse verdict",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.verdict.keep }}", "rightValue": "true", "operator": { "type": "boolean", "operation": "equals" } },
+            { "id": "c2", "leftValue": "={{ $json.verdict.risk }}", "rightValue": "high", "operator": { "type": "string", "operation": "notEquals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "guardrail-if",
+      "name": "Approved by guardrail?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2200, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.items SET status = 'filtered', filter_reason = $2, updated_at = now() WHERE id = $1;",
+        "additionalFields": {
+          "queryParams": "={{ $json.id }},={{ $json.verdict.reason || 'guardrail_reject' }}"
+        }
+      },
+      "id": "mark-filtered",
+      "name": "Mark filtered",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2420, 440],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.items\nSET status = 'enriched',\n    enrich_result = $2::jsonb,\n    updated_at = now()\nWHERE id = $1;",
+        "additionalFields": {
+          "queryParams": "={{ $json.id }},={{ JSON.stringify($json.verdict) }}"
+        }
+      },
+      "id": "mark-enriched",
+      "name": "Mark enriched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2420, 160],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "State-machine: ingested → enriched. Drafting + fan-out is owned by workflow 06 (per-platform) or workflow 08 (batch). This workflow ONLY runs guardrail so the two downstream paths can claim `status='enriched'` with FOR UPDATE SKIP LOCKED."
+    },
+    {
+      "parameters": {
+        "content": "## State machine (v2.1 — post round-T)\n\n- ingested  → (guardrail reject)   filtered\n- ingested  → (guardrail approve)  enriched\n- enriched  → (workflow 06 picks)  fanning_out  → drafted\n- enriched  → (workflow 08 picks)  batch_rewriting → drafted\n\nOnly one of (06, 08) should be enabled at a time for a given org; both use\n`FOR UPDATE SKIP LOCKED` plus distinct transitional statuses so they are\nsafe to co-run, but will duplicate work if both fire.\n\n## Loop pattern\n\nWF01 deliberately does NOT use SplitInBatches. n8n's splitInBatches v3 has\ntwo outputs (done=main[0], loop=main[1]); wiring the loop correctly is\nfragile and breaks once a downstream node does a 1→N fan-out (each fan-out\nitem triggers an extra loop-back, advancing the batch pointer past unread\nitems). Feeds are iterated natively by RSS Read running once per input,\nand article-level context is re-attached via `$('Feed catalogue').item`\npaired-item tracking inside the Normalize Code node (runOnceForEachItem).\n\n## On-error\n\nConnect every HTTP Request's `onError: continueErrorOutput` to a shared\nnotifier, or configure this workflow under Settings → Error Workflow =\n`99-error-alert`."
+      },
+      "id": "note-state",
+      "name": "State machine note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2420, 620]
+    }
+  ],
+  "connections": {
+    "Every 15m":                   { "main": [[ { "node": "Feed catalogue", "type": "main", "index": 0 } ]] },
+    "Feed catalogue":              { "main": [[ { "node": "RSS Read",      "type": "main", "index": 0 } ]] },
+    "RSS Read":                    { "main": [[ { "node": "Normalize + hash", "type": "main", "index": 0 } ]] },
+    "Normalize + hash":            { "main": [[ { "node": "Upsert content.items", "type": "main", "index": 0 } ]] },
+    "Upsert content.items":        { "main": [[ { "node": "Only new items", "type": "main", "index": 0 } ]] },
+    "Only new items":              { "main": [[ { "node": "Guardrail filter", "type": "main", "index": 0 } ]] },
+    "Guardrail filter":            { "main": [[ { "node": "Parse verdict", "type": "main", "index": 0 } ]] },
+    "Parse verdict":               { "main": [[ { "node": "Approved by guardrail?", "type": "main", "index": 0 } ]] },
+    "Approved by guardrail?":      { "main": [ [ { "node": "Mark enriched", "type": "main", "index": 0 } ], [ { "node": "Mark filtered", "type": "main", "index": 0 } ] ] }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "errorWorkflow": "99-error-alert"
+  },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

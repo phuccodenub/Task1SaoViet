@@ -1,0 +1,33 @@
+{
+  "name": "99 — Error alert (shared)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [260, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_ALERT_CHAT_ID }}\",\n  \"parse_mode\": \"Markdown\",\n  \"text\": \"*n8n workflow failed*\\nWorkflow: `{{ $json.workflow.name }}`\\nExecution: `{{ $json.execution.id }}`\\nNode: `{{ $json.execution.lastNodeExecuted }}`\\nError: {{ $json.execution.error.message }}\"\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "telegram",
+      "name": "Telegram alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 300]
+    }
+  ],
+  "connections": { "Error Trigger": { "main": [[ { "node": "Telegram alert", "type": "main", "index": 0 } ]] } },
+  "active": true,
+  "settings": { "executionOrder": "v1" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

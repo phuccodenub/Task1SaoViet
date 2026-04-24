@@ -1,0 +1,98 @@
+{
+  "_comment": "Seed monitors for Uptime Kuma. Import via Settings → Backup → Restore (JSON). Version: UptimeKuma 1.23.x.",
+  "version": "1.23.x",
+  "notificationList": [
+    {
+      "name": "Telegram — Ops channel",
+      "type": "telegram",
+      "isDefault": true,
+      "applyExisting": true,
+      "telegramBotToken": "{{ env.TELEGRAM_BOT_TOKEN }}",
+      "telegramChatID": "{{ env.TELEGRAM_ALERT_CHAT_ID }}",
+      "telegramUseTemplate": true,
+      "telegramTemplateParseMode": "Markdown",
+      "telegramMessageTemplate": "*{{name}}* is {{status}}\nMonitor: `{{monitor.name}}`\nURL/Host: `{{monitor.url}}{{monitor.hostname}}`\nCode: `{{heartbeat.msg}}`\nAt: `{{heartbeat.localDateTime}}`"
+    }
+  ],
+  "monitorList": [
+    {
+      "name": "ZaloCRM — /health",
+      "type": "http",
+      "url": "http://zalo-crm-app:3000/health",
+      "interval": 60,
+      "retryInterval": 30,
+      "maxretries": 3,
+      "timeout": 10,
+      "accepted_statuscodes_json": "[\"200-299\"]",
+      "tags": [{ "name": "tier0", "color": "red" }, { "name": "zalocrm" }]
+    },
+    {
+      "name": "ZaloCRM — Zalo pool ready (JSON)",
+      "type": "json-query",
+      "url": "http://zalo-crm-app:3000/api/v1/status",
+      "interval": 120,
+      "maxretries": 2,
+      "timeout": 15,
+      "jsonPath": "$.status",
+      "expectedValue": "ok",
+      "tags": [{ "name": "tier0", "color": "red" }, { "name": "zalocrm" }]
+    },
+    {
+      "name": "n8n — /healthz",
+      "type": "http",
+      "url": "http://n8n:5678/healthz",
+      "interval": 60,
+      "maxretries": 3,
+      "timeout": 10,
+      "accepted_statuscodes_json": "[\"200-299\"]",
+      "tags": [{ "name": "tier1", "color": "orange" }, { "name": "n8n" }]
+    },
+    {
+      "name": "LiteLLM — /health/liveliness",
+      "type": "http",
+      "url": "http://litellm:4000/health/liveliness",
+      "interval": 60,
+      "maxretries": 3,
+      "timeout": 10,
+      "accepted_statuscodes_json": "[\"200-299\"]",
+      "tags": [{ "name": "tier1", "color": "orange" }, { "name": "ai" }]
+    },
+    {
+      "name": "LiteLLM — chat endpoint smoke",
+      "type": "keyword",
+      "method": "POST",
+      "url": "http://litellm:4000/v1/chat/completions",
+      "interval": 300,
+      "maxretries": 2,
+      "timeout": 30,
+      "httpBodyEncoding": "json",
+      "body": "{\"model\":\"cheap-vi\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":5}",
+      "headers": "{\"Authorization\":\"Bearer {{env.LITELLM_MASTER_KEY}}\",\"Content-Type\":\"application/json\"}",
+      "keyword": "choices",
+      "tags": [{ "name": "tier1" }, { "name": "ai" }]
+    },
+    {
+      "name": "Redis — TCP 6379",
+      "type": "port",
+      "hostname": "redis",
+      "port": 6379,
+      "interval": 60,
+      "tags": [{ "name": "tier0", "color": "red" }]
+    },
+    {
+      "name": "Postgres — TCP 5432",
+      "type": "port",
+      "hostname": "db",
+      "port": 5432,
+      "interval": 60,
+      "tags": [{ "name": "tier0", "color": "red" }]
+    },
+    {
+      "name": "Backup freshness (custom push)",
+      "type": "push",
+      "interval": 86400,
+      "_comment": "The Postgres backup cronjob curls the Push URL on success. Alert fires if no heartbeat in 25 hours.",
+      "tags": [{ "name": "tier1" }, { "name": "backup" }]
+    }
+  ]
+}

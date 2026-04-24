@@ -1,0 +1,43 @@
+groups:
+  - name: automation-budget
+    rules:
+      - alert: LiteLLMDailySpendOver10USD
+        expr: increase(litellm_spend_metric[24h]) > 10
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "LiteLLM daily spend > $10"
+          description: "Check per-key usage in /ui; consider downgrading to cheap-vi."
+
+      - alert: LiteLLMErrorRateHigh
+        expr: sum(rate(litellm_requests_total{status=~"5.."}[10m])) / sum(rate(litellm_requests_total[10m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "LiteLLM 5xx rate > 5% (10m)"
+
+  - name: n8n-health
+    rules:
+      - alert: N8NWorkflowFailureBurst
+        expr: increase(n8n_workflow_executions_total{status="failed"}[15m]) > 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "n8n: more than 5 failed executions in 15 min"
+
+  - name: content-pipeline
+    rules:
+      - alert: PublishSuccessLow
+        expr: content_publish_success_ratio < 0.9
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Publish success < 90% in the last 24h"
+
+      - alert: AutoReplyRateOffTarget
+        expr: |
+          (cskh_auto_reply_ratio < 0.5) or (cskh_auto_reply_ratio > 0.9)
+        for: 30m
+        labels: { severity: info }
+        annotations:
+          summary: "CSKH auto-reply rate outside 50–90% band"

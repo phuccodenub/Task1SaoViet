@@ -1,0 +1,141 @@
+content_publish_success_ratio:
+  query: |
+    -- Success ratio is computed over AUTOMATED attempts only. Rows with
+    -- status='manual_required' (e.g. Zalo OA in v1 — no broadcast endpoint)
+    -- are excluded from both numerator and denominator so the dashboard does
+    -- not swing to red just because zalo_oa drafts exist.
+    WITH last_day AS (
+      SELECT status FROM content.publish_log
+      WHERE attempted_at > now() - interval '24 hours'
+        AND status IN ('success','failed','retrying')
+    )
+    SELECT
+      CASE WHEN COUNT(*) = 0 THEN 1.0
+           ELSE (COUNT(*) FILTER (WHERE status = 'success'))::float / COUNT(*)
+      END AS ratio
+    FROM last_day;
+  metrics:
+    - ratio:
+        usage: GAUGE
+        description: "Fraction of automated publish attempts that succeeded last 24h (manual_required rows excluded)"
+
+content_publish_status_24h:
+  query: |
+    SELECT platform, status, COUNT(*) AS total
+    FROM content.publish_log
+    WHERE attempted_at > now() - interval '24 hours'
+    GROUP BY platform, status;
+  metrics:
+    - platform:
+        usage: LABEL
+    - status:
+        usage: LABEL
+    - total:
+        usage: COUNTER
+        description: "Publish attempts per platform and status last 24h (success/failed/retrying/manual_required)"
+
+content_manual_required_24h:
+  query: |
+    SELECT platform, COUNT(*) AS total
+    FROM content.publish_log
+    WHERE attempted_at > now() - interval '24 hours'
+      AND status = 'manual_required'
+    GROUP BY platform;
+  metrics:
+    - platform:
+        usage: LABEL
+    - total:
+        usage: GAUGE
+        description: "Drafts flagged as manual_required in last 24h (e.g. Zalo OA broadcast backlog for editors)"
+
+# CSKH shadow-mode adoption: treat action_taken='auto_reply' as live autoreplies.
+# 'shadow' means bot drafted but did not send; 'handoff' means routed to human.
+cskh_auto_reply_ratio:
+  query: |
+    WITH last_day AS (
+      SELECT action_taken FROM omni.intent_log
+      WHERE created_at > now() - interval '24 hours'
+    )
+    SELECT
+      CASE WHEN COUNT(*) = 0 THEN 0
+           ELSE (COUNT(*) FILTER (WHERE action_taken = 'auto_reply'))::float / COUNT(*)
+      END AS ratio
+    FROM last_day;
+  metrics:
+    - ratio:
+        usage: GAUGE
+        description: "Fraction of inbound CSKH messages auto-answered (action_taken='auto_reply') last 24h"
+
+cskh_action_counts_24h:
+  query: |
+    SELECT action_taken, COUNT(*) AS total
+    FROM omni.intent_log
+    WHERE created_at > now() - interval '24 hours'
+    GROUP BY action_taken;
+  metrics:
+    - action_taken:
+        usage: LABEL
+    - total:
+        usage: COUNTER
+        description: "CSKH decisions grouped by action_taken (auto_reply/shadow/handoff/skipped) last 24h"
+
+cskh_intent_counts_24h:
+  query: |
+    SELECT intent, COUNT(*) AS total
+    FROM omni.intent_log
+    WHERE created_at > now() - interval '24 hours'
+    GROUP BY intent;
+  metrics:
+    - intent:
+        usage: LABEL
+    - total:
+        usage: COUNTER
+        description: "CSKH intents classified in the last 24h"
+
+# Lead conversion is computed without adding a boolean column: we derive it
+# from intent='lead_qualified' (model signal) and action_taken='handoff'
+# (operational signal). Split as two series so Grafana can plot both.
+cskh_lead_signal_24h:
+  query: |
+    SELECT
+      COUNT(*) FILTER (WHERE intent = 'lead_qualified')     AS intent_lead_qualified,
+      COUNT(*) FILTER (WHERE action_taken = 'handoff')      AS action_handoff,
+      COUNT(*)                                              AS total_messages
+    FROM omni.intent_log
+    WHERE created_at > now() - interval '24 hours';
+  metrics:
+    - intent_lead_qualified:
+        usage: GAUGE
+        description: "Count of intent='lead_qualified' in last 24h (model-detected leads)"
+    - action_handoff:
+        usage: GAUGE
+        description: "Count of action_taken='handoff' in last 24h (routed to human)"
+    - total_messages:
+        usage: GAUGE
+        description: "Total intent_log rows in last 24h (denominator for conversion ratios)"
+
+cskh_staff_verdict_24h:
+  query: |
+    SELECT COALESCE(staff_verdict, 'unlabeled') AS staff_verdict, COUNT(*) AS total
+    FROM omni.intent_log
+    WHERE created_at > now() - interval '24 hours'
+    GROUP BY 1;
+  metrics:
+    - staff_verdict:
+        usage: LABEL
+    - total:
+        usage: COUNTER
+        description: "Staff shadow-mode verdicts (approved/rejected/edited/unlabeled) last 24h"
+
+omni_messages_24h:
+  query: |
+    SELECT channel, COUNT(*) AS total
+    FROM omni.external_messages
+    WHERE received_at > now() - interval '24 hours'
+    GROUP BY channel;
+  metrics:
+    - channel:
+        usage: LABEL
+    - total:
+        usage: COUNTER
+        description: "Inbound messages per channel last 24h"

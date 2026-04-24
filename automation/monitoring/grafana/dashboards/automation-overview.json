@@ -1,0 +1,146 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "schemaVersion": 39,
+  "title": "Automation Overview",
+  "uid": "automation-overview",
+  "tags": ["automation", "content", "cskh"],
+  "timezone": "Asia/Ho_Chi_Minh",
+  "time": { "from": "now-24h", "to": "now" },
+  "refresh": "1m",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Publish success (24h)",
+      "targets": [
+        { "datasource": { "type": "prometheus" }, "expr": "content_publish_success_ratio", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "thresholds": { "mode": "absolute", "steps": [
+        { "color": "red", "value": null }, { "color": "orange", "value": 0.8 }, { "color": "green", "value": 0.9 }
+      ] } } },
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "type": "stat",
+      "title": "Auto-reply ratio (CSKH, 24h)",
+      "targets": [
+        { "datasource": { "type": "prometheus" }, "expr": "cskh_auto_reply_ratio", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "type": "stat",
+      "title": "LiteLLM spend (last 24h, USD)",
+      "targets": [
+        { "datasource": { "type": "prometheus" }, "expr": "sum(increase(litellm_spend_metric[24h]))", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } },
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "type": "stat",
+      "title": "LiteLLM error rate (10m)",
+      "targets": [
+        { "datasource": { "type": "prometheus" },
+          "expr": "sum(rate(litellm_requests_total{status=~\"5..\"}[10m])) / sum(rate(litellm_requests_total[10m]))",
+          "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Publish attempts by platform (24h)",
+      "targets": [
+        { "datasource": { "type": "prometheus" },
+          "expr": "sum by (platform) (increase(content_publish_total_24h[1h]))",
+          "refId": "A", "legendFormat": "{{platform}}" }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "CSKH intents by type (24h)",
+      "targets": [
+        { "datasource": { "type": "prometheus" },
+          "expr": "sum by (intent) (increase(cskh_intent_counts_24h[1h]))",
+          "refId": "A", "legendFormat": "{{intent}}" }
+      ],
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 8 }
+    },
+    {
+      "type": "table",
+      "title": "Lead signal breakdown 7d (intent=lead_qualified vs action=handoff)",
+      "description": "No is_lead column yet — we derive 'lead signal' from intent='lead_qualified' (model) and 'handoff' from action_taken='handoff' (operational). Split kept intentionally so shadow-mode analysis can compare the two.",
+      "datasource": { "type": "postgres", "uid": "Postgres-ZaloCRM" },
+      "targets": [
+        {
+          "format": "table",
+          "rawSql": "SELECT channel, COUNT(*) AS messages, COUNT(*) FILTER (WHERE intent = 'lead_qualified') AS lead_qualified, COUNT(*) FILTER (WHERE action_taken = 'handoff') AS handoffs, ROUND(100.0 * COUNT(*) FILTER (WHERE intent = 'lead_qualified') / GREATEST(COUNT(*), 1), 2) AS lead_pct, ROUND(100.0 * COUNT(*) FILTER (WHERE action_taken = 'handoff') / GREATEST(COUNT(*), 1), 2) AS handoff_pct FROM omni.intent_log WHERE created_at > now() - interval '7 days' GROUP BY channel ORDER BY messages DESC"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 14, "w": 24, "h": 8 }
+    },
+    {
+      "type": "stat",
+      "title": "Lead-qualified ratio (24h)",
+      "description": "intent='lead_qualified' / total intent_log rows in last 24h. postgres_exporter emits one metric per column, so we divide the two emitted gauges directly.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "cskh_lead_signal_24h_intent_lead_qualified / clamp_min(cskh_lead_signal_24h_total_messages, 1)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "x": 0, "y": 22, "w": 6, "h": 6 }
+    },
+    {
+      "type": "stat",
+      "title": "Handoff ratio (24h)",
+      "description": "action_taken='handoff' / total intent_log rows in last 24h.",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus" },
+          "expr": "cskh_lead_signal_24h_action_handoff / clamp_min(cskh_lead_signal_24h_total_messages, 1)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit" } },
+      "gridPos": { "x": 6, "y": 22, "w": 6, "h": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Inbound messages by channel (24h)",
+      "targets": [
+        { "datasource": { "type": "prometheus" },
+          "expr": "sum by (channel) (increase(omni_messages_24h[1h]))",
+          "refId": "A", "legendFormat": "{{channel}}" }
+      ],
+      "gridPos": { "x": 12, "y": 22, "w": 12, "h": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "CSKH actions by type (24h)",
+      "description": "Breakdown of omni.intent_log.action_taken — useful to watch shadow\u2192auto_reply ramp.",
+      "targets": [
+        { "datasource": { "type": "prometheus" },
+          "expr": "sum by (action_taken) (increase(cskh_action_counts_24h[1h]))",
+          "refId": "A", "legendFormat": "{{action_taken}}" }
+      ],
+      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Staff verdicts (shadow review, 7d)",
+      "description": "omni.intent_log.staff_verdict buckets: approved / rejected / edited / unlabeled.",
+      "targets": [
+        { "datasource": { "type": "prometheus" },
+          "expr": "sum by (staff_verdict) (increase(cskh_staff_verdict_24h[1h]))",
+          "refId": "A", "legendFormat": "{{staff_verdict}}" }
+      ],
+      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 6 }
+    }
+  ]
+}

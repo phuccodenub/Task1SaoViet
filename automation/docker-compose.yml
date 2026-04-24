@@ -1,0 +1,183 @@
+# ------------------------------------------------------------------
+# Automation stack — n8n + Redis + LiteLLM + Uptime Kuma.
+# Runs ALONGSIDE the existing ZaloCRM stack (../ZaloCRM/docker-compose.yml).
+# Shares the ZaloCRM Postgres by joining its external network + extra DBs.
+#
+# Prerequisites:
+#   1. ZaloCRM stack already `docker compose up -d` (creates network `zalocrm_default`
+#      and the `db` service).
+#   2. Additional databases `n8n` and `litellm` created in the shared Postgres.
+#      Run automation/scripts/01-create-databases.sql once against the db container:
+#         docker exec -i zalo-crm-db psql -U $DB_USER -d postgres < scripts/01-create-databases.sql
+#   3. Copy .env.example -> .env and fill secrets.
+# ------------------------------------------------------------------
+
+networks:
+  zalocrm_shared:
+    external: true
+    name: zalocrm_default
+
+services:
+  # ── LiteLLM gateway — single OpenAI-compatible endpoint for ALL providers
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: automation-litellm
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4000:4000"
+    env_file:
+      - .env
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY}
+      DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/litellm
+      STORE_MODEL_IN_DB: "True"
+      UI_USERNAME: ${LITELLM_UI_USERNAME:-admin}
+      UI_PASSWORD: ${LITELLM_UI_PASSWORD}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    networks:
+      - zalocrm_shared
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=5).read()\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── Redis — queue + cache + intent cache + rate limit store
+  redis:
+    image: redis:7-alpine
+    container_name: automation-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - zalocrm_shared
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── n8n — orchestration backbone
+  n8n:
+    image: n8nio/n8n:1.72.1
+    container_name: automation-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    env_file:
+      - .env
+    environment:
+      # Persistence: Postgres for workflows, executions, credentials
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${DB_PASSWORD}
+
+      # Queue mode with Redis — enables horizontal scaling & retries
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+      # Prune to avoid runaway executions_data growth
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "72"
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: "10000"
+
+      # Security — webhook signature + basic auth on UI
+      N8N_BASIC_AUTH_ACTIVE: "true"
+      N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      N8N_HOST: ${N8N_HOST:-n8n.localhost}
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      N8N_PORT: 5678
+      WEBHOOK_URL: ${N8N_WEBHOOK_URL}
+
+      # Timezone for cron nodes
+      GENERIC_TIMEZONE: Asia/Ho_Chi_Minh
+      TZ: Asia/Ho_Chi_Minh
+
+      # Disable telemetry to avoid outbound noise
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+
+      # Allow Code nodes to require Node.js built-ins used by signature verification
+      # (workflow 01 normalize hash, workflow 04 HMAC, workflow 05 X-Hub-Signature-256).
+      # Without this n8n's sandbox blocks `require('crypto')` and throws at runtime.
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      NODE_FUNCTION_ALLOW_EXTERNAL: ""
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n/workflows:/workflows:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - zalocrm_shared
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── n8n worker — picks up jobs from the Redis queue (scale with `docker compose up -d --scale n8n-worker=3`)
+  n8n-worker:
+    image: n8nio/n8n:1.72.1
+    container_name: automation-n8n-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: db
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${DB_PASSWORD}
+      EXECUTIONS_MODE: queue
+      QUEUE_BULL_REDIS_HOST: redis
+      QUEUE_BULL_REDIS_PORT: 6379
+      QUEUE_BULL_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      GENERIC_TIMEZONE: Asia/Ho_Chi_Minh
+      TZ: Asia/Ho_Chi_Minh
+      # Must mirror the primary n8n container so queued executions can run
+      # Code nodes that call require('crypto') on the worker side.
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+      NODE_FUNCTION_ALLOW_EXTERNAL: ""
+    command: ["worker", "--concurrency=5"]
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      redis:
+        condition: service_healthy
+      n8n:
+        condition: service_healthy
+    networks:
+      - zalocrm_shared
+
+  # ── Uptime Kuma — health monitoring + Telegram alerts
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: automation-uptime-kuma
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    volumes:
+      - uptime_kuma_data:/app/data
+    networks:
+      - zalocrm_shared
+
+volumes:
+  redis_data:
+  n8n_data:
+  uptime_kuma_data:

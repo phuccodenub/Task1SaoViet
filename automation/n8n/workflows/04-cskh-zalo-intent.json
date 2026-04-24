@@ -1,0 +1,342 @@
+{
+  "name": "04 — CSKH Zalo Intent Bot v1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "zalocrm/events",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      },
+      "id": "webhook-in",
+      "name": "ZaloCRM webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 300],
+      "webhookId": "zalocrm-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify HMAC-SHA256 signature produced by ZaloCRM webhook-service.ts.\n// Using require() + explicit NODE_FUNCTION_ALLOW_BUILTIN=crypto in n8n env\n// because ES-module `import` is rejected by n8n's Code-node VM by default.\nconst crypto = require('crypto');\nconst secret    = $env.ZALOCRM_WEBHOOK_SECRET;\nconst signature = $input.first().headers['x-webhook-signature'];\nconst event     = $input.first().headers['x-webhook-event'];\nconst raw       = $input.first().body;  // from rawBody option\nconst rawStr    = typeof raw === 'string' ? raw : JSON.stringify(raw);\nif (!secret || !signature) throw new Error('missing signature');\nconst expected  = crypto.createHmac('sha256', secret).update(rawStr).digest('hex');\nconst expBuf    = Buffer.from(expected);\nconst sigBuf    = Buffer.from(signature);\nif (expBuf.length !== sigBuf.length || !crypto.timingSafeEqual(expBuf, sigBuf)) {\n  throw new Error('bad_signature');\n}\nconst parsed    = typeof raw === 'string' ? JSON.parse(raw) : raw;\nreturn [{ json: { event, data: parsed.data, timestamp: parsed.timestamp } }];"
+      },
+      "id": "verify-sig",
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            { "leftValue": "={{ $json.event }}", "rightValue": "message.received", "operator": { "type": "string", "operation": "equals" } },
+            { "leftValue": "={{ $json.data.senderType }}", "rightValue": "contact", "operator": { "type": "string", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-inbound",
+      "name": "Only inbound contact messages",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [640, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { received: true } }}",
+        "options": {}
+      },
+      "id": "ack-200",
+      "name": "Ack 200 to ZaloCRM",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [640, 140],
+      "notesInFlow": true,
+      "notes": "Ack 200 fires immediately after signature verify (fan-out from Verify signature). This guarantees the ZaloCRM webhook-service sees a 200 within its 10s deadline regardless of which branch (inbound/outbound) the IF router picks."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize Vietnamese text for intent caching.\n// Payload shape guaranteed by ZaloCRM message-handler.ts:\n//   { messageId, conversationId, zaloAccountId, threadId, threadType,\n//     senderType, senderUid, senderName, contactId, content, contentType, sentAt }\nconst crypto = require('crypto');\nconst d = $json.data || {};\nconst text = String(d.content || '').normalize('NFC').toLowerCase().replace(/\\s+/g, ' ').trim();\nconst hash = crypto.createHash('sha256').update(text).digest('hex');\nreturn [{ json: {\n  orgId: $env.ZALOCRM_ORG_ID,\n  channel: 'zalo',\n  convKey: `zalo:${d.conversationId || d.threadId}`,\n  contactId: d.contactId || null,\n  conversationId: d.conversationId,\n  zaloAccountId: d.zaloAccountId,\n  threadId: d.threadId,\n  threadType: d.threadType || 'user',\n  senderType: d.senderType,\n  contactName: d.senderName || 'Khách',\n  raw: d,\n  text,\n  messageHash: hash\n}}];"
+      },
+      "id": "normalize",
+      "name": "Normalize + hash",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=intent:{{ $json.orgId }}:{{ $json.messageHash }}",
+        "options": {}
+      },
+      "id": "cache-get",
+      "name": "Intent cache GET",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1080, 300],
+      "credentials": { "redis": { "id": "redis-main", "name": "Redis" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [{ "leftValue": "={{ $json.value }}", "rightValue": "", "operator": { "type": "string", "operation": "notEmpty" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "if-cache-hit",
+      "name": "Cache hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1300, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.LITELLM_KEY_CSKH }}" },
+          { "name": "Content-Type",  "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"cheap-vi\",\n  \"temperature\": 0,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"Phân loại tin nhắn CSKH. Nhãn: greeting, faq_price, faq_shipping, faq_product, order_status, complaint, lead_qualified, spam, other. Trả JSON: {\\\"intent\\\":\\\"...\\\",\\\"confidence\\\":0-1,\\\"urgency\\\":\\\"low|med|high\\\",\\\"leadScore\\\":0-100,\\\"language\\\":\\\"vi|en\\\",\\\"needsHuman\\\":true|false,\\\"reason\\\":\\\"...\\\"}\" },\n    { \"role\": \"user\", \"content\": \"{{ $('Normalize + hash').first().json.text }}\" }\n  ]\n}",
+        "options": { "timeout": 15000, "retry": { "maxTries": 2 } }
+      },
+      "id": "classify",
+      "name": "Classify intent (cheap-vi)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1540, 400]
+    },
+    {
+      "parameters": {
+        "jsCode": "const cached = $('Intent cache GET').first().json?.value;\nconst usage  = $input.first().json?.usage || {};\nconst raw    = cached || ($input.first().json.choices?.[0]?.message?.content ?? '{}');\nlet parsed;\ntry { parsed = JSON.parse(raw); } catch { parsed = { intent: 'other', confidence: 0, urgency: 'low', leadScore: 0, language: 'vi', needsHuman: true, reason: 'parse_error' }; }\nconst ctx = $('Normalize + hash').first().json;\nreturn [{ json: {\n  ...ctx,\n  intent:     parsed.intent,\n  confidence: parsed.confidence,\n  urgency:    parsed.urgency,\n  leadScore:  parsed.leadScore,\n  language:   parsed.language || 'vi',\n  needsHuman: parsed.needsHuman || parsed.intent === 'complaint' || parsed.confidence < 0.7,\n  reason:     parsed.reason,\n  fromCache:  Boolean(cached),\n  tokensIn:   usage.prompt_tokens || 0,\n  tokensOut:  usage.completion_tokens || 0,\n  model:      $input.first().json.model || 'cached'\n}}];"
+      },
+      "id": "parse-intent",
+      "name": "Parse intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key":   "=intent:{{ $json.orgId }}:{{ $json.messageHash }}",
+        "value": "={{ JSON.stringify({ intent: $json.intent, confidence: $json.confidence, urgency: $json.urgency, leadScore: $json.leadScore, needsHuman: $json.needsHuman, language: $json.language }) }}",
+        "expire": true,
+        "ttl": 86400
+      },
+      "id": "cache-set",
+      "name": "Intent cache SET (24h)",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1980, 500],
+      "credentials": { "redis": { "id": "redis-main", "name": "Redis" } }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "outputKey": "handoff",   "conditions": { "options": { "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.needsHuman }}", "rightValue": "true", "operator": { "type": "boolean", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "lead",      "conditions": { "options": { "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.intent }}", "rightValue": "lead_qualified", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "faq",       "conditions": { "options": { "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.intent }}", "rightValue": "^faq_", "operator": { "type": "string", "operation": "regex" } }], "combinator": "and" } },
+            { "outputKey": "greeting",  "conditions": { "options": { "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.intent }}", "rightValue": "greeting", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "other" }
+      },
+      "id": "route-intent",
+      "name": "Route intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [2200, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.ZALOCRM_BASE_URL }}/api/public/contacts/{{ $('Normalize + hash').first().json.contactId }}",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{ $env.ZALOCRM_API_KEY }}" }] },
+        "options": { "timeout": 10000 }
+      },
+      "id": "contact-fetch",
+      "name": "Fetch contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 160]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $env.ZALOCRM_BASE_URL }}/api/public/contacts/{{ $('Normalize + hash').first().json.contactId }}",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "X-Api-Key", "value": "={{ $env.ZALOCRM_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tags\": [\"needs_human\"],\n  \"leadScore\": {{ $('Parse intent').first().json.leadScore }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "tag-needs-human",
+      "name": "Tag needs_human",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2660, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_SALES_CHAT_ID }}\",\n  \"parse_mode\": \"Markdown\",\n  \"text\": \"*CSKH cần hỗ trợ*\\nIntent: `{{ $('Parse intent').first().json.intent }}` ({{ $('Parse intent').first().json.confidence }})\\nKH: {{ $('Normalize + hash').first().json.contactName }}\\nNội dung: {{ $('Normalize + hash').first().json.text }}\\nURL: {{ $env.ZALOCRM_BASE_URL }}/conversations/{{ $('Normalize + hash').first().json.conversationId }}\"\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "alert-sales",
+      "name": "Alert Sales (Telegram)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2880, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.LITELLM_KEY_CSKH }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"cheap-vi\",\n  \"temperature\": 0.3,\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"Bạn là nhân viên CSKH của [Tên DN]. Trả lời ngắn gọn, thân thiện bằng tiếng Việt, tối đa 300 ký tự. KHÔNG bịa giá, KHÔNG hứa hẹn cụ thể. Nếu thiếu thông tin, nói 'Em kiểm tra lại và báo lại ngay' rồi gợi ý nhân viên sẽ liên hệ.\" },\n    { \"role\": \"user\", \"content\": \"Intent: {{ $('Parse intent').first().json.intent }}\\nKhách hỏi: {{ $('Normalize + hash').first().json.text }}\" }\n  ]\n}",
+        "options": { "timeout": 20000, "retry": { "maxTries": 2 } }
+      },
+      "id": "generate-reply",
+      "name": "Generate reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 380]
+    },
+    {
+      "parameters": {
+        "jsCode": "const txt = ($input.first().json.choices?.[0]?.message?.content || '').trim().slice(0, 500);\nconst intent = $('Parse intent').first().json;\nconst shadow = ($env.CSKH_SHADOW_MODE ?? 'true') === 'true';\nreturn [{ json: { reply: txt, shadow, ...intent } }];"
+      },
+      "id": "shape-reply",
+      "name": "Shape reply + shadow flag",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 380]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "typeValidation": "strict" },
+          "conditions": [{ "leftValue": "={{ $json.shadow }}", "rightValue": "false", "operator": { "type": "boolean", "operation": "equals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "if-live",
+      "name": "Live (not shadow)?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2880, 380]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.ZALOCRM_BASE_URL }}/api/public/messages/send",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "X-Api-Key", "value": "={{ $env.ZALOCRM_API_KEY }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"zaloAccountId\": \"{{ $('Normalize + hash').first().json.zaloAccountId }}\",\n  \"threadId\": \"{{ $('Normalize + hash').first().json.threadId }}\",\n  \"threadType\": \"{{ $('Normalize + hash').first().json.threadType }}\",\n  \"content\": {{ JSON.stringify($json.reply) }}\n}",
+        "options": { "timeout": 15000, "retry": { "maxTries": 3, "waitBetweenTries": 2000 } }
+      },
+      "id": "send-reply",
+      "name": "Send reply via ZaloCRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize the log record across the three upstream branches (handoff,\n// live auto-reply, shadow). Each branch enters with a different $json shape\n// (Telegram API response / ZaloCRM send response / Shape reply object), so we\n// reconstruct the record from Parse intent + Shape reply via node references,\n// never from $json.\nconst pi   = $('Parse intent').first().json;\nconst norm = $('Normalize + hash').first().json;\n\n// Handoff path is deterministic from Parse intent: either the classifier asked\n// for human, or intent is lead_qualified. In both cases Shape reply did NOT run.\nconst isHandoff = pi.needsHuman === true || pi.intent === 'lead_qualified';\n\nlet shadow = true;\nlet reply  = null;\nif (!isHandoff) {\n  try {\n    const sr = $('Shape reply + shadow flag').first()?.json;\n    if (sr) {\n      shadow = sr.shadow !== false;        // default to shadow when unset\n      reply  = (sr.reply || '').toString() || null;\n    }\n  } catch (_) {\n    // Shape reply did not execute in this run; keep defaults.\n  }\n}\n\nconst actionTaken = isHandoff\n  ? 'handoff'\n  : (shadow ? 'shadow' : 'auto_reply');\n\nreturn [{ json: {\n  orgId:       norm.orgId,\n  channel:     'zalo',\n  convKey:     norm.convKey,\n  messageHash: norm.messageHash,\n  intent:      pi.intent,\n  confidence:  pi.confidence,\n  leadScore:   pi.leadScore,\n  urgency:     pi.urgency,\n  language:    pi.language || 'vi',\n  actionTaken,\n  botDraft:    reply,\n  actualReply: (!isHandoff && !shadow) ? reply : null,\n  model:       pi.model,\n  tokensIn:    pi.tokensIn,\n  tokensOut:   pi.tokensOut\n}}];"
+      },
+      "id": "build-log",
+      "name": "Build log payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3200, 380]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO omni.intent_log (org_id, channel, conversation_key, message_hash, intent, confidence, lead_score, urgency, language, action_taken, bot_draft, actual_reply, model, tokens_in, tokens_out, latency_ms)\nVALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 0);",
+        "additionalFields": {
+          "queryParams": "={{ $json.orgId }},={{ $json.channel }},={{ $json.convKey }},={{ $json.messageHash }},={{ $json.intent }},={{ $json.confidence }},={{ $json.leadScore }},={{ $json.urgency }},={{ $json.language }},={{ $json.actionTaken }},={{ $json.botDraft }},={{ $json.actualReply }},={{ $json.model }},={{ $json.tokensIn }},={{ $json.tokensOut }}"
+        }
+      },
+      "id": "log-intent",
+      "name": "Log to omni.intent_log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3420, 380],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    }
+  ],
+  "connections": {
+    "ZaloCRM webhook":               { "main": [[ { "node": "Verify signature", "type": "main", "index": 0 } ]] },
+    "Verify signature":              { "main": [[
+        { "node": "Ack 200 to ZaloCRM", "type": "main", "index": 0 },
+        { "node": "Only inbound contact messages", "type": "main", "index": 0 }
+    ]] },
+    "Only inbound contact messages": { "main": [
+        [ { "node": "Normalize + hash", "type": "main", "index": 0 } ],
+        []
+    ] },
+    "Normalize + hash":              { "main": [[ { "node": "Intent cache GET", "type": "main", "index": 0 } ]] },
+    "Intent cache GET":              { "main": [[ { "node": "Cache hit?", "type": "main", "index": 0 } ]] },
+    "Cache hit?":                    { "main": [
+        [ { "node": "Parse intent", "type": "main", "index": 0 } ],
+        [ { "node": "Classify intent (cheap-vi)", "type": "main", "index": 0 } ]
+    ] },
+    "Classify intent (cheap-vi)":    { "main": [[ { "node": "Parse intent", "type": "main", "index": 0 } ]] },
+    "Parse intent":                  { "main": [[
+        { "node": "Route intent", "type": "main", "index": 0 },
+        { "node": "Intent cache SET (24h)", "type": "main", "index": 0 }
+    ]] },
+    "Route intent":                  { "main": [
+        [ { "node": "Fetch contact", "type": "main", "index": 0 } ],
+        [ { "node": "Fetch contact", "type": "main", "index": 0 } ],
+        [ { "node": "Generate reply", "type": "main", "index": 0 } ],
+        [ { "node": "Generate reply", "type": "main", "index": 0 } ],
+        [ { "node": "Generate reply", "type": "main", "index": 0 } ]
+    ] },
+    "Fetch contact":                 { "main": [[ { "node": "Tag needs_human", "type": "main", "index": 0 } ]] },
+    "Tag needs_human":               { "main": [[ { "node": "Alert Sales (Telegram)", "type": "main", "index": 0 } ]] },
+    "Alert Sales (Telegram)":        { "main": [[ { "node": "Build log payload", "type": "main", "index": 0 } ]] },
+    "Generate reply":                { "main": [[ { "node": "Shape reply + shadow flag", "type": "main", "index": 0 } ]] },
+    "Shape reply + shadow flag":     { "main": [[ { "node": "Live (not shadow)?", "type": "main", "index": 0 } ]] },
+    "Live (not shadow)?":            { "main": [
+        [ { "node": "Send reply via ZaloCRM", "type": "main", "index": 0 } ],
+        [ { "node": "Build log payload", "type": "main", "index": 0 } ]
+    ] },
+    "Send reply via ZaloCRM":        { "main": [[ { "node": "Build log payload", "type": "main", "index": 0 } ]] },
+    "Build log payload":             { "main": [[ { "node": "Log to omni.intent_log", "type": "main", "index": 0 } ]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

@@ -1,0 +1,91 @@
+{
+  "name": "09 — Monthly cost review",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 1 * *" }] }
+      },
+      "id": "cron-1st",
+      "name": "1st of month 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT COALESCE(model, 'unknown') AS model,\n       COUNT(*) AS requests,\n       ROUND(SUM(spend)::numeric, 4) AS spend_usd,\n       ROUND(AVG(spend)::numeric, 6) AS avg_cost_per_req\nFROM \"LiteLLM_SpendLogs\"\nWHERE \"startTime\" >= date_trunc('month', now() - interval '1 month')\n  AND \"startTime\" <  date_trunc('month', now())\nGROUP BY 1\nORDER BY spend_usd DESC\nLIMIT 20;"
+      },
+      "id": "spend-by-model",
+      "name": "LiteLLM spend by model",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": { "postgres": { "id": "pg-litellm", "name": "Postgres — LiteLLM" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Report publishes split into automated outcomes vs manual_required gates\n-- so the monthly cost review does not count Zalo OA manual work as failures.\nSELECT platform,\n       COUNT(*) FILTER (WHERE status IN ('success','failed','retrying'))       AS automated_attempts,\n       COUNT(*) FILTER (WHERE status = 'success')                               AS successes,\n       COUNT(*) FILTER (WHERE status = 'failed')                                AS failures,\n       COUNT(*) FILTER (WHERE status = 'manual_required')                       AS manual_required,\n       COUNT(*)                                                                 AS total_rows\nFROM content.publish_log\nWHERE attempted_at >= date_trunc('month', now() - interval '1 month')\n  AND attempted_at <  date_trunc('month', now())\nGROUP BY platform\nORDER BY total_rows DESC;"
+      },
+      "id": "publish",
+      "name": "Publish last month",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 480],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT intent,\n       COUNT(*) AS messages,\n       COUNT(*) FILTER (WHERE intent = 'lead_qualified')        AS leads,\n       COUNT(*) FILTER (WHERE action_taken = 'handoff')         AS handoffs,\n       COUNT(*) FILTER (WHERE action_taken = 'auto_reply')      AS auto_replies,\n       COUNT(*) FILTER (WHERE staff_verdict = 'approved')       AS staff_approved,\n       COUNT(*) FILTER (WHERE staff_verdict = 'rejected')       AS staff_rejected\nFROM omni.intent_log\nWHERE created_at >= date_trunc('month', now() - interval '1 month')\n  AND created_at <  date_trunc('month', now())\nGROUP BY intent\nORDER BY messages DESC;"
+      },
+      "id": "cskh",
+      "name": "CSKH last month",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 660],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "const spend = $('LiteLLM spend by model').all().map(x => x.json);\nconst publish = $('Publish last month').all().map(x => x.json);\nconst cskh = $('CSKH last month').all().map(x => x.json);\nconst fmt = (rows, keys) => rows.length ? rows.map(r => keys.map(k => `${k}=${r[k]}`).join(' ')).join('\\n') : '(empty)';\nconst total = spend.reduce((a, r) => a + Number(r.spend_usd || 0), 0).toFixed(4);\nconst text = [\n  `*Monthly automation review*`,\n  ``,\n  `*Total LLM spend:* $${total}`,\n  '```',\n  fmt(spend.slice(0, 10), ['model','requests','spend_usd','avg_cost_per_req']),\n  '```',\n  `*Publish outcomes (automated_attempts excludes manual_required):*`,\n  '```',\n  fmt(publish, ['platform','automated_attempts','successes','failures','manual_required']),\n  '```',\n  `*CSKH intents (leads=intent=lead_qualified, handoffs=action_taken=handoff):*`,\n  '```',\n  fmt(cskh, ['intent','messages','leads','handoffs','auto_replies','staff_approved','staff_rejected']),\n  '```'\n].join('\\n');\nreturn [{ json: { text } }];"
+      },
+      "id": "report",
+      "name": "Compose report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 480]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_ALERT_CHAT_ID }}\",\n  \"parse_mode\": \"Markdown\",\n  \"text\": {{ JSON.stringify($json.text) }}\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "tg",
+      "name": "Telegram monthly digest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [940, 480]
+    }
+  ],
+  "connections": {
+    "1st of month 09:00":       { "main": [[
+      { "node": "LiteLLM spend by model", "type": "main", "index": 0 },
+      { "node": "Publish last month", "type": "main", "index": 0 },
+      { "node": "CSKH last month", "type": "main", "index": 0 }
+    ]] },
+    "LiteLLM spend by model":   { "main": [[ { "node": "Compose report", "type": "main", "index": 0 } ]] },
+    "Publish last month":       { "main": [[ { "node": "Compose report", "type": "main", "index": 0 } ]] },
+    "CSKH last month":          { "main": [[ { "node": "Compose report", "type": "main", "index": 0 } ]] },
+    "Compose report":           { "main": [[ { "node": "Telegram monthly digest", "type": "main", "index": 0 } ]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

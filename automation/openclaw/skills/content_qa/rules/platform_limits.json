@@ -1,0 +1,6 @@
+{
+  "facebook": { "maxBodyLength": 5000, "maxHashtags": 5, "forbidUrlPatterns": [] },
+  "zalo_oa":  { "maxBodyLength":  500, "maxHashtags": 0, "forbidUrlPatterns": ["bit\\.ly", "tinyurl", "cutt\\.ly"] },
+  "tiktok":   { "maxBodyLength":  150, "maxHashtags": 8, "forbidUrlPatterns": [] },
+  "linkedin": { "maxBodyLength": 1500, "maxHashtags": 3, "forbidUrlPatterns": [] }
+}

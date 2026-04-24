@@ -1,0 +1,114 @@
+{
+  "name": "08 — Batch rewrite fan-in (cost saver)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 20 }] }
+      },
+      "id": "cron-20m",
+      "name": "Every 20m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH ready AS (\n  SELECT id FROM content.items\n  WHERE org_id = $1\n    AND status = 'enriched'\n    AND (enrich_result->>'keep')::boolean = true\n  ORDER BY created_at ASC\n  LIMIT 5 FOR UPDATE SKIP LOCKED\n)\nUPDATE content.items i SET status = 'batch_rewriting', locked_at = now(), updated_at = now()\nFROM ready WHERE i.id = ready.id\nRETURNING i.id, i.title, i.body, i.raw_payload->>'topic' AS topic;",
+        "additionalFields": { "queryParams": "={{ $env.ZALOCRM_ORG_ID }}" }
+      },
+      "id": "batch-pick",
+      "name": "Pick up to 5 items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "State: enriched → batch_rewriting (transitional, safe to co-run with workflow 06 via SKIP LOCKED, but prefer ONE of 06/08 per org to avoid double-spend on LLM)."
+    },
+    {
+      "parameters": {
+        "jsCode": "const rows = $input.all().map(r => r.json);\nif (rows.length === 0) return [];\nconst payload = rows.map((r, i) => ({ idx: i + 1, id: r.id, title: r.title, body: (r.body || '').slice(0, 1500), topic: r.topic }));\nreturn [{ json: { payload, rows } }];"
+      },
+      "id": "shape",
+      "name": "Pack batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.LITELLM_KEY_CONTENT }}" },
+          { "name": "Content-Type",  "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"rewrite-vi\",\n  \"temperature\": 0.6,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"Bạn nhận danh sách bài viết và trả JSON: {\\\"results\\\":[{\\\"idx\\\":N,\\\"facebook\\\":{\\\"body\\\":\\\"...\\\",\\\"hashtags\\\":[\\\"#...\\\"]}}]} . Mỗi bài viết Facebook 700-1200 ký tự.\" },\n    { \"role\": \"user\", \"content\": {{ JSON.stringify(JSON.stringify($json.payload)) }} }\n  ]\n}",
+        "options": { "timeout": 60000, "retry": { "maxTries": 1 } }
+      },
+      "id": "llm",
+      "name": "Single LLM call (N items)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Defensive parse of LLM batch output.\n// W2 (round W): the previous version blindly emitted whatever the model\n// returned then let Mark items drafted mark ALL claimed ids as drafted —\n// creating a bug where items without a corresponding draft row silently\n// flipped to 'drafted'. This version:\n//   1) validates cardinality (log-level warn only, we still want partial drafts),\n//   2) deduplicates on idx (LLM sometimes repeats — keep first),\n//   3) skips rows where body is empty (LLM returned idx but no content).\n// Items without an emitted draft stay in 'batch_rewriting' with locked_at set\n// (see Mark items drafted's EXISTS gate and WF07 watchdog branch B).\nconst rows = $('Pack batch').first().json.rows;\nconst parsed = JSON.parse($json.choices?.[0]?.message?.content || '{\"results\":[]}');\nconst rawResults = Array.isArray(parsed.results) ? parsed.results : [];\n\nif (rawResults.length !== rows.length) {\n  console.warn(`[WF08] LLM cardinality mismatch: batch=${rows.length}, returned=${rawResults.length}. Missing items will stay batch_rewriting (picked up by WF07 stuck watchdog after 30m).`);\n}\n\nconst seenIdx = new Set();\nconst out = [];\nfor (const r of rawResults) {\n  const idx = Number(r.idx);\n  if (!Number.isInteger(idx) || idx < 1 || idx > rows.length) continue;\n  if (seenIdx.has(idx)) continue;\n  seenIdx.add(idx);\n  const item = rows[idx - 1];\n  const fb = r.facebook || {};\n  const body = (fb.body || '').trim();\n  if (!body) continue;\n  out.push({ json: {\n    itemId: item.id,\n    orgId:  $env.ZALOCRM_ORG_ID,\n    platform: 'facebook',\n    variantKey: 'batch-v1',\n    body,\n    hashtags: Array.isArray(fb.hashtags) ? fb.hashtags : [],\n    status: 'pending_review',\n    scheduledAt: new Date(Date.now() + 2 * 3600 * 1000).toISOString()\n  } });\n}\nreturn out;"
+      },
+      "id": "split",
+      "name": "Explode to drafts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO content.drafts (item_id, org_id, platform, variant_key, body, hashtags, status, scheduled_at, queued_at)\nVALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, now())\nON CONFLICT (item_id, platform, variant_key) DO UPDATE\n  SET updated_at = now()\nRETURNING id, item_id, queued_at;",
+        "additionalFields": {
+          "queryParams": "={{ $json.itemId }},={{ $json.orgId }},={{ $json.platform }},={{ $json.variantKey }},={{ $json.body }},={{ JSON.stringify($json.hashtags) }},={{ $json.status }},={{ $json.scheduledAt }}"
+        }
+      },
+      "id": "save",
+      "name": "Save drafts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "WF08 does NOT push to Google Sheet review queue (editors access batch-v1 drafts via admin UI). Therefore queued_at = now() is set here at INSERT time so the WF06/WF08 shared gate semantics stay consistent: 'queued_at IS NOT NULL' = editor-visible.\n\nX1 (round X): changed ON CONFLICT DO NOTHING → DO UPDATE SET updated_at=now() RETURNING id,item_id,queued_at. Rationale: same class bug fixed for WF06 in W1. If a previous run already inserted all batch-v1 drafts but failed before Mark items drafted, a pure DO NOTHING would conflict on every row and emit zero items → Mark items drafted never triggers → items stay stuck in 'batch_rewriting'. DO UPDATE (no-op, updated_at only) GUARANTEES output on every conflict so the downstream mark query always runs. We intentionally do NOT overwrite body/hashtags/status because editors may have touched them in admin UI between retries."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE content.items i\nSET status = 'drafted', locked_at = NULL, updated_at = now()\nWHERE i.id = ANY(string_to_array($1, ',')::uuid[])\n  AND i.status = 'batch_rewriting'\n  AND EXISTS (\n    SELECT 1 FROM content.drafts d\n    WHERE d.item_id = i.id\n      AND d.variant_key = 'batch-v1'\n      AND d.queued_at IS NOT NULL\n  )\nRETURNING i.id;",
+        "additionalFields": { "queryParams": "={{ $('Pack batch').first().json.rows.map(r => r.id).join(',') }}" }
+      },
+      "id": "mark",
+      "name": "Mark items drafted",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "W2 (round W): previously this UPDATE-ed every claimed id unconditionally — when the LLM returned fewer results than the batch, items without a draft were marked 'drafted' anyway. Now we require (a) status still = 'batch_rewriting' (idempotent against retry/requeue) AND (b) an EXISTS row in content.drafts with variant_key='batch-v1' AND queued_at IS NOT NULL (editor-visible). Items missing a draft stay 'batch_rewriting' with locked_at ≠ NULL → WF07 branch B alerts on-call after 30 minutes.\n\nX1 (round X): this node still reads ids from $('Pack batch').first(), so it does not depend on Save drafts output cardinality. BUT it only fires if Save drafts emits at least one item (n8n pipeline semantics). Save drafts now uses DO UPDATE RETURNING so emission is guaranteed on full-conflict retry."
+    }
+  ],
+  "connections": {
+    "Every 20m":              { "main": [[ { "node": "Pick up to 5 items", "type": "main", "index": 0 } ]] },
+    "Pick up to 5 items":     { "main": [[ { "node": "Pack batch", "type": "main", "index": 0 } ]] },
+    "Pack batch":             { "main": [[ { "node": "Single LLM call (N items)", "type": "main", "index": 0 } ]] },
+    "Single LLM call (N items)": { "main": [[ { "node": "Explode to drafts", "type": "main", "index": 0 } ]] },
+    "Explode to drafts":      { "main": [[ { "node": "Save drafts", "type": "main", "index": 0 } ]] },
+    "Save drafts":            { "main": [[ { "node": "Mark items drafted", "type": "main", "index": 0 } ]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

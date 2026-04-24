@@ -1,0 +1,151 @@
+# ─── LiteLLM Gateway config ─────────────────────────────────────────────────
+# Single OpenAI-compatible endpoint for ALL providers. Cost-first routing with
+# premium escalation tier. Swap models without touching n8n workflows.
+#
+# Docs: https://docs.litellm.ai/docs/proxy/configs
+# ───────────────────────────────────────────────────────────────────────────
+
+model_list:
+  # ═══ CHEAP TIER — default for intent, rewrite, summary, sentiment ═══
+
+  - model_name: cheap-vi
+    # Kimi moonshot-v1-8k — Vietnamese fluent, cheapest, 8k context
+    litellm_params:
+      model: openai/moonshot-v1-8k
+      api_base: https://api.moonshot.cn/v1
+      api_key: os.environ/KIMI_API_KEY
+      max_tokens: 1024
+      temperature: 0.3
+    model_info:
+      input_cost_per_token: 0.0000006    # ~$0.60/1M in
+      output_cost_per_token: 0.0000012   # ~$1.20/1M out
+      max_input_tokens: 8000
+
+  - model_name: cheap-vi-fallback
+    # Gemini 1.5 Flash — free 15 RPM, paid tier cheap. Good fallback.
+    litellm_params:
+      model: gemini/gemini-1.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+      max_tokens: 1024
+      temperature: 0.3
+    model_info:
+      input_cost_per_token: 0.000000075
+      output_cost_per_token: 0.0000003
+      max_input_tokens: 1000000
+
+  - model_name: cheap-vi-third
+    # Qwen Plus — DashScope Alibaba, strong Vietnamese/Chinese
+    litellm_params:
+      model: openai/qwen-plus
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api_key: os.environ/QWEN_API_KEY
+      max_tokens: 1024
+      temperature: 0.3
+    model_info:
+      input_cost_per_token: 0.0000008
+      output_cost_per_token: 0.000002
+
+  # ═══ BALANCED TIER — for rewrite fan-out multi-platform ═══
+
+  - model_name: rewrite-vi
+    litellm_params:
+      model: openai/moonshot-v1-32k
+      api_base: https://api.moonshot.cn/v1
+      api_key: os.environ/KIMI_API_KEY
+      max_tokens: 2048
+      temperature: 0.6
+    model_info:
+      input_cost_per_token: 0.0000012
+      output_cost_per_token: 0.0000024
+
+  - model_name: rewrite-vi-fallback
+    litellm_params:
+      model: gemini/gemini-1.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+      max_tokens: 2048
+      temperature: 0.6
+
+  # ═══ GUARDRAIL TIER — sentiment / policy / factuality ═══
+
+  - model_name: guardrail
+    # Gemini 2.0 Flash free tier handles this fine + near-zero cost.
+    litellm_params:
+      model: gemini/gemini-2.0-flash-exp
+      api_key: os.environ/GEMINI_API_KEY
+      max_tokens: 512
+      temperature: 0.0
+
+  # ═══ PREMIUM TIER — VIP replies, complaint handling, sensitive QA ═══
+
+  - model_name: premium-vi
+    litellm_params:
+      model: anthropic/claude-3-5-sonnet-20241022
+      api_key: os.environ/ANTHROPIC_API_KEY
+      max_tokens: 2048
+      temperature: 0.4
+
+  - model_name: premium-vi-fallback
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      max_tokens: 2048
+      temperature: 0.4
+    model_info:
+      input_cost_per_token: 0.00000015
+      output_cost_per_token: 0.0000006
+
+  # ═══ EMBEDDINGS — for semantic dedup & intent cache keys ═══
+
+  - model_name: embedding-vi
+    litellm_params:
+      model: gemini/text-embedding-004
+      api_key: os.environ/GEMINI_API_KEY
+
+# ─── Routing & fallbacks ────────────────────────────────────────────────────
+# If the primary model in a group fails or hits rate limits, LiteLLM cycles
+# through fallbacks before surfacing an error to n8n.
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 30
+  allowed_fails: 3
+  cooldown_time: 60
+  fallbacks:
+    - cheap-vi: ["cheap-vi-fallback", "cheap-vi-third"]
+    - rewrite-vi: ["rewrite-vi-fallback", "cheap-vi"]
+    - premium-vi: ["premium-vi-fallback", "rewrite-vi"]
+
+# ─── Per-virtual-key budgets (created later via /key/generate UI or API) ────
+# Illustrative defaults; actual keys created at Phase 1.3 bootstrap.
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+  json_logs: true
+  success_callback: ["langfuse"]        # optional, free self-host for tracing
+  failure_callback: ["langfuse"]
+  telemetry: false
+  # Hard global cap so a runaway workflow can't burn the budget.
+  max_budget: 200                        # USD/month — alert + throttle at this ceiling
+  budget_duration: 30d
+  # Cache identical prompts for N seconds to cut cost on repeated intents.
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    password: os.environ/REDIS_PASSWORD
+    ttl: 3600                            # 1h general cache; intent cache overridden per-call
+    supported_call_types: ["acompletion", "completion"]
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  # Separate virtual keys per workflow so cost can be attributed.
+  allow_user_auth: true
+  ui_access_mode: admin_only
+  # Alerting is disabled by default for local/dev bootstrap. Enabling Slack /
+  # Telegram alerts requires a non-empty provider-specific webhook map in the
+  # current LiteLLM proxy schema; a blank string crashes startup.
+  alerting: []
+  alert_types: []

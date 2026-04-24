@@ -1,0 +1,207 @@
+{
+  "name": "05 — CSKH FB Messenger v1",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "meta/messenger",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "verify-get",
+      "name": "Webhook — verify (GET)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 200],
+      "webhookId": "fb-messenger-verify"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "typeValidation": "strict" },
+          "conditions": [{ "leftValue": "={{ $json.query['hub.verify_token'] }}", "rightValue": "={{ $env.FB_VERIFY_TOKEN }}", "operator": { "type": "string", "operation": "equals" } }],
+          "combinator": "and"
+        }
+      },
+      "id": "verify-token",
+      "name": "Token match?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [420, 200]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.query['hub.challenge'] }}",
+        "options": {}
+      },
+      "id": "echo-challenge",
+      "name": "Echo hub.challenge",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 140]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "Forbidden",
+        "responseCode": 403,
+        "options": {}
+      },
+      "id": "deny",
+      "name": "Deny",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [660, 260]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta/messenger",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      },
+      "id": "events-post",
+      "name": "Webhook — events (POST)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [200, 500],
+      "webhookId": "fb-messenger-events"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify X-Hub-Signature-256 against FB_APP_SECRET.\n// require() is mandatory inside n8n Code nodes; also relies on\n// NODE_FUNCTION_ALLOW_BUILTIN=crypto being set on the n8n container.\nconst crypto = require('crypto');\nconst sig = $input.first().headers['x-hub-signature-256'];\nconst raw = $input.first().body;\nconst rawStr = typeof raw === 'string' ? raw : JSON.stringify(raw);\nconst expected = 'sha256=' + crypto.createHmac('sha256', $env.FB_APP_SECRET).update(rawStr).digest('hex');\nif (!sig) throw new Error('missing_signature');\nconst expBuf = Buffer.from(expected);\nconst sigBuf = Buffer.from(sig);\nif (expBuf.length !== sigBuf.length || !crypto.timingSafeEqual(expBuf, sigBuf)) {\n  throw new Error('bad_signature');\n}\nconst body = typeof raw === 'string' ? JSON.parse(raw) : raw;\nconst out = [];\nfor (const entry of body.entry || []) {\n  for (const ev of entry.messaging || []) {\n    if (!ev.message || ev.message.is_echo) continue;\n    out.push({ json: {\n      psid: ev.sender.id,\n      pageId: entry.id,\n      text: ev.message.text || '',\n      mid: ev.message.mid,\n      timestamp: ev.timestamp\n    }});\n  }\n}\nreturn out;"
+      },
+      "id": "parse-events",
+      "name": "Verify + parse events",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "EVENT_RECEIVED",
+        "options": {}
+      },
+      "id": "ack-fb",
+      "name": "Ack 200 to Meta",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [420, 380],
+      "notesInFlow": true,
+      "notes": "Fan-out target #1 of Webhook POST (single output, two downstream nodes). Replies EVENT_RECEIVED within Meta's 20s deadline while Verify+parse continues asynchronously. Webhook node has only ONE output in n8n — connection JSON uses multiple entries inside main[0], NOT main[1]."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO omni.external_messages (org_id, channel, external_user_id, external_thread_id, external_message_id, sender_type, sender_name, content, content_type, raw_payload, received_at)\nVALUES ($1, 'facebook', $2, $2, $3, 'contact', NULL, $4, 'text', $5::jsonb, to_timestamp($6::bigint / 1000.0))\nON CONFLICT (channel, external_message_id) DO NOTHING\nRETURNING id;",
+        "additionalFields": {
+          "queryParams": "={{ $env.ZALOCRM_ORG_ID }},={{ $json.psid }},={{ $json.mid }},={{ $json.text }},={{ JSON.stringify($json) }},={{ $json.timestamp }}"
+        }
+      },
+      "id": "store-msg",
+      "name": "Store external_messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [660, 500],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://litellm:4000/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [
+          { "name": "Authorization", "value": "=Bearer {{ $env.LITELLM_KEY_CSKH }}" },
+          { "name": "Content-Type", "value": "application/json" }
+        ] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"cheap-vi\",\n  \"temperature\": 0,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    { \"role\": \"system\", \"content\": \"Phân loại CSKH. Trả JSON: {\\\"intent\\\":\\\"greeting|faq_price|faq_product|order_status|complaint|lead_qualified|spam|other\\\",\\\"confidence\\\":0-1,\\\"needsHuman\\\":true|false}\" },\n    { \"role\": \"user\", \"content\": \"{{ $('Verify + parse events').first().json.text }}\" }\n  ]\n}",
+        "options": { "timeout": 15000, "retry": { "maxTries": 2 } }
+      },
+      "id": "classify-fb",
+      "name": "Classify intent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = JSON.parse($input.first().json.choices?.[0]?.message?.content || '{}');\nconst e = $('Verify + parse events').first().json;\nreturn [{ json: { ...e, ...r, shadow: ($env.CSKH_SHADOW_MODE ?? 'true') === 'true' } }];"
+      },
+      "id": "merge-fb",
+      "name": "Merge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 500]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "typeValidation": "strict" },
+          "conditions": [
+            { "leftValue": "={{ $json.needsHuman }}", "rightValue": "false", "operator": { "type": "boolean", "operation": "equals" } },
+            { "leftValue": "={{ $json.shadow }}",     "rightValue": "false", "operator": { "type": "boolean", "operation": "equals" } }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-send-fb",
+      "name": "Auto-send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1320, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/me/messages?access_token={{ $env.FB_PAGE_ACCESS_TOKEN }}",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"recipient\": { \"id\": \"{{ $json.psid }}\" },\n  \"message\":   { \"text\": \"Em đã nhận thông tin, xin đợi 1 chút ạ.\" },\n  \"messaging_type\": \"RESPONSE\"\n}",
+        "options": { "timeout": 15000, "retry": { "maxTries": 3, "waitBetweenTries": 2000 } }
+      },
+      "id": "send-fb",
+      "name": "Send Messenger reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 420]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_SALES_CHAT_ID }}\",\n  \"text\": \"FB Messenger — needs human\\nPSID: {{ $json.psid }}\\nIntent: {{ $json.intent }}\\nMsg: {{ $json.text }}\"\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "alert-sales-fb",
+      "name": "Alert Sales",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 580]
+    }
+  ],
+  "connections": {
+    "Webhook — verify (GET)":   { "main": [[ { "node": "Token match?", "type": "main", "index": 0 } ]] },
+    "Token match?":             { "main": [ [ { "node": "Echo hub.challenge", "type": "main", "index": 0 } ], [ { "node": "Deny", "type": "main", "index": 0 } ] ] },
+    "Webhook — events (POST)":  { "main": [[
+        { "node": "Ack 200 to Meta", "type": "main", "index": 0 },
+        { "node": "Verify + parse events", "type": "main", "index": 0 }
+    ]] },
+    "Verify + parse events":    { "main": [[ { "node": "Store external_messages", "type": "main", "index": 0 } ]] },
+    "Store external_messages":  { "main": [[ { "node": "Classify intent", "type": "main", "index": 0 } ]] },
+    "Classify intent":          { "main": [[ { "node": "Merge", "type": "main", "index": 0 } ]] },
+    "Merge":                    { "main": [[ { "node": "Auto-send?", "type": "main", "index": 0 } ]] },
+    "Auto-send?":               { "main": [[ { "node": "Send Messenger reply", "type": "main", "index": 0 } ], [ { "node": "Alert Sales", "type": "main", "index": 0 } ]] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}

@@ -1,0 +1,7 @@
+# Allowed factual claims. Format: one phrase per line.
+# If a draft mentions a percentage / monetary claim, it must appear here
+# or in the item's topic context, otherwise it gets flagged UNVERIFIED_CLAIM.
+giảm 10%
+giảm 20%
+tặng voucher 50k
+miễn phí vận chuyển

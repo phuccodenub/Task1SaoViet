@@ -1,0 +1,234 @@
+{
+  "name": "02 — Content Publish Scheduler v1",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 5 }] }
+      },
+      "id": "cron-5m",
+      "name": "Every 5m",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH due AS (\n  SELECT id FROM content.drafts\n  WHERE org_id = $1\n    AND status IN ('approved', 'scheduled')\n    AND scheduled_at <= now()\n  ORDER BY scheduled_at ASC\n  LIMIT 1 FOR UPDATE SKIP LOCKED\n)\nUPDATE content.drafts d\nSET status = 'scheduled', updated_at = now()\nFROM due\nWHERE d.id = due.id\nRETURNING d.id, d.platform, d.body, d.media_urls, d.hashtags, d.item_id;",
+        "additionalFields": { "queryParams": "={{ $env.ZALOCRM_ORG_ID }}" }
+      },
+      "id": "fetch-due",
+      "name": "Fetch due drafts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [480, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } }
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "one-by-one",
+      "name": "Split per draft",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [700, 300],
+      "notesInFlow": true,
+      "notes": "Fetch due drafts already uses LIMIT 1, so no loop-back is required. This node is retained only as a stable item-reference anchor for downstream Normalize response code."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "outputKey": "facebook", "conditions": { "options": { "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.platform }}", "rightValue": "facebook", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "zalo_oa",  "conditions": { "options": { "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.platform }}", "rightValue": "zalo_oa", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "tiktok",   "conditions": { "options": { "caseSensitive": true, "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.platform }}", "rightValue": "tiktok", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "other" }
+      },
+      "id": "switch-platform",
+      "name": "Route by platform",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [940, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v20.0/{{ $env.FB_PAGE_ID }}/feed",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Content-Type", "value": "application/json" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": {{ JSON.stringify($json.body) }},\n  \"access_token\": \"{{ $env.FB_PAGE_ACCESS_TOKEN }}\"\n}",
+        "options": {
+          "timeout": 20000,
+          "retry": { "maxTries": 3, "waitBetweenTries": 5000 }
+        }
+      },
+      "id": "fb-post",
+      "name": "FB Graph — /page/feed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 160],
+      "onError": "continueErrorOutput",
+      "notesInFlow": true,
+      "notes": "n8n expression syntax: the leading `=` marks the ENTIRE value as an expression. Any `=` inside the URL path is a literal character."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Zalo OA broadcast is NOT auto-published in v1.\n//\n// Background: ZaloCRM's public API `/api/public/messages/send` only sends a\n// message into an *existing thread* (`{ zaloAccountId, threadId, content }`).\n// It has no endpoint to broadcast to OA followers. Zalo's own OpenAPI\n// broadcast (message/promotion, broadcast/message) requires pre-approved\n// templates, a dedicated OA access_token, and Zalo Business verification.\n//\n// Until a proper broadcast integration is built, we surface Zalo OA drafts as\n// an explicit 'manual_broadcast_required' failure so that:\n//   - drafts are not silently left in 'scheduled' forever;\n//   - the Telegram alert fans editors over to the Zalo Business dashboard;\n//   - operators can UPDATE content.drafts SET status='published' manually\n//     after broadcasting.\n//\n// Workflow 06 already removed zalo_oa from its platform plan in v3, so this\n// branch only fires for legacy drafts or drafts created manually. See\n// docs/12-zalo-oa-publish.md.\nreturn [{ json: {\n  error: {\n    code: 'MANUAL_BROADCAST_REQUIRED',\n    message: 'Zalo OA broadcast chưa được tự động hoá trong v1. Editor vui lòng broadcast thủ công qua Zalo Business.'\n  },\n  statusCode: 501\n}}];"
+      },
+      "id": "zalo-oa-stub",
+      "name": "Zalo OA — manual broadcast stub",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 340],
+      "notesInFlow": true,
+      "notes": "Replaces the broken `/api/public/messages/send` broadcast call. Emits a structured error whose code 'MANUAL_BROADCAST_REQUIRED' is recognised by Normalize response as outcome='manual_required', keeping it OUT of failure metrics. Telegram notice (manual) pings editors so they broadcast manually via Zalo Business."
+    },
+    {
+      "parameters": {
+        "content": "### TikTok path\n\nFor Phase 1 we **do not** auto-publish to TikTok. TikTok video publishing needs their Business API which requires review. This branch is a placeholder — it logs the draft and pings OpenClaw's `tiktok_post` skill if available (Phase 2.2)."
+      },
+      "id": "note-tiktok",
+      "name": "TikTok fallback note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1200, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.OPENCLAW_BASE_URL }}/skills/tiktok_post/execute",
+        "sendHeaders": true,
+        "headerParameters": { "parameters": [{ "name": "Authorization", "value": "=Bearer {{ $env.OPENCLAW_API_KEY }}" }] },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ body: $json.body, media: $json.media_urls, draftId: $json.id }) }}",
+        "options": { "timeout": 120000, "retry": { "maxTries": 2, "waitBetweenTries": 10000 } }
+      },
+      "id": "tiktok-openclaw",
+      "name": "OpenClaw → tiktok_post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, 500],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fallback branch for Route by platform. Fires when a draft carries a\n// platform string that no explicit output matches (e.g. someone inserted\n// 'instagram' via admin SQL before the workflow learned about it).\n//\n// We funnel this through the same Normalize response → Log + mark outcome\n// pipeline so that:\n//   - the draft gets a deterministic terminal state ('failed'),\n//   - publish_log captures the mismatch with a distinct error code, and\n//   - Telegram alert fires so ops can either add the platform handler or\n//     clean up the DB row.\nconst draft = $json;\nreturn [{ json: {\n  error: {\n    code: 'UNSUPPORTED_PLATFORM',\n    message: `Draft ${draft.id} has unsupported platform='${draft.platform}'. No publisher branch exists in WF02.`\n  },\n  statusCode: 500\n}}];"
+      },
+      "id": "unsupported-platform",
+      "name": "Unsupported platform",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 660],
+      "notesInFlow": true,
+      "notes": "Terminal for any draft.platform NOT in {facebook, zalo_oa, tiktok}. Classified as outcome='failed' (real system error, not a business gate) so on-call gets paged via Telegram alert (failed)."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Classify each publish response into one of three outcomes:\n//   outcome='success'          → real publish OK, flip to published.\n//   outcome='manual_required'  → operational gate (e.g. Zalo OA has no\n//                                broadcast endpoint in v1). NOT a failure —\n//                                it is work that has to be done by humans.\n//                                Kept separate from failure metrics so the\n//                                publish_success_ratio dashboard stays clean.\n//   outcome='failed'           → real failure (HTTP 4xx/5xx, throw, etc.).\n//\n// Error codes treated as manual-required gates (extend as more channels are\n// stubbed out the same way):\nconst MANUAL_CODES = new Set(['MANUAL_BROADCAST_REQUIRED']);\nconst draft = $('Split per draft').item.json;\nconst resp  = $input.first().json;\nconst httpCode = $input.first().headers?.['x-status-code'] ?? ($input.first().statusCode ?? 200);\nconst hasError = Boolean(resp.error) || (resp.statusCode && resp.statusCode >= 400);\nconst errorCode = resp.error?.code ? String(resp.error.code) : (hasError ? 'http_error' : null);\nlet outcome;\nif (!hasError) outcome = 'success';\nelse if (errorCode && MANUAL_CODES.has(errorCode)) outcome = 'manual_required';\nelse outcome = 'failed';\nreturn [{ json: {\n  draftId: draft.id,\n  platform: draft.platform,\n  outcome,\n  ok: outcome === 'success',\n  isManual: outcome === 'manual_required',\n  isFailed: outcome === 'failed',\n  externalId: resp.id || resp.data?.id || resp.post_id || null,\n  errorCode,\n  errorMessage: resp.error?.message || resp.message || null,\n  httpCode\n}}];"
+      },
+      "id": "normalize-resp",
+      "name": "Normalize response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- $1 draftId, $2 outcome (success|manual_required|failed), $3 externalId,\n-- $4 errorMessage, $5 platform, $6 errorCode\nWITH upd AS (\n  UPDATE content.drafts\n  SET status = CASE $2\n                 WHEN 'success'         THEN 'published'\n                 WHEN 'manual_required' THEN 'manual_required'\n                 ELSE 'failed'\n               END,\n      external_id   = COALESCE($3, external_id),\n      published_at  = CASE WHEN $2 = 'success' THEN now() ELSE published_at END,\n      reject_reason = CASE WHEN $2 = 'success' THEN NULL ELSE $4 END,\n      updated_at    = now()\n  WHERE id = $1\n  RETURNING id\n)\nINSERT INTO content.publish_log\n  (draft_id, platform, attempt, status, external_id, error_code, error_message, attempted_at)\nSELECT $1, $5, 1, $2, $3, $6, $4, now()\nFROM upd;",
+        "additionalFields": {
+          "queryParams": "={{ $json.draftId }},={{ $json.outcome }},={{ $json.externalId }},={{ $json.errorMessage }},={{ $json.platform }},={{ $json.errorCode }}"
+        }
+      },
+      "id": "log-result",
+      "name": "Log + mark outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1940, 300],
+      "credentials": { "postgres": { "id": "pg-zalocrm", "name": "Postgres — ZaloCRM" } },
+      "notesInFlow": true,
+      "notes": "Writes BOTH the draft terminal state and a publish_log row with status=outcome. Keeping 'manual_required' distinct from 'failed' lets the Grafana success ratio and the WF09 monthly review filter these out instead of inflating failure counters."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            { "outputKey": "failed",  "conditions": { "options": { "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.outcome }}", "rightValue": "failed", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } },
+            { "outputKey": "manual",  "conditions": { "options": { "typeValidation": "strict" }, "conditions": [{ "leftValue": "={{ $json.outcome }}", "rightValue": "manual_required", "operator": { "type": "string", "operation": "equals" } }], "combinator": "and" } }
+          ]
+        },
+        "options": { "fallbackOutput": "extra", "renameFallbackOutput": "success" }
+      },
+      "id": "switch-outcome",
+      "name": "Route by outcome",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [2180, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_ALERT_CHAT_ID }}\",\n  \"parse_mode\": \"Markdown\",\n  \"text\": \"*Publish FAILED*\\nPlatform: {{ $json.platform }}\\nDraft: {{ $json.draftId }}\\nCode: {{ $json.errorCode }}\\nMsg: {{ $json.errorMessage }}\"\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "telegram-alert",
+      "name": "Telegram alert (failed)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2420, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.telegram.org/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendMessage",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"chat_id\": \"{{ $env.TELEGRAM_ALERT_CHAT_ID }}\",\n  \"parse_mode\": \"Markdown\",\n  \"text\": \"*Manual broadcast required*\\nPlatform: {{ $json.platform }}\\nDraft: {{ $json.draftId }}\\nReason: {{ $json.errorCode }}\\nEditor: broadcast thủ công qua Zalo Business, sau đó UPDATE content.drafts SET status='published', external_id='<post_id>' WHERE id='{{ $json.draftId }}';\"\n}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "telegram-manual",
+      "name": "Telegram notice (manual)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2420, 380],
+      "notesInFlow": true,
+      "notes": "Different channel text + different semantics from the failure alert so on-call knows this is a workflow boundary, not a system bug."
+    }
+  ],
+  "connections": {
+    "Every 5m":             { "main": [[ { "node": "Fetch due drafts", "type": "main", "index": 0 } ]] },
+    "Fetch due drafts":     { "main": [[ { "node": "Split per draft", "type": "main", "index": 0 } ]] },
+    "Split per draft":      { "main": [[ { "node": "Route by platform", "type": "main", "index": 0 } ]] },
+    "Route by platform":    { "main": [
+        [ { "node": "FB Graph — /page/feed", "type": "main", "index": 0 } ],
+        [ { "node": "Zalo OA — manual broadcast stub", "type": "main", "index": 0 } ],
+        [ { "node": "OpenClaw → tiktok_post", "type": "main", "index": 0 } ],
+        [ { "node": "Unsupported platform", "type": "main", "index": 0 } ]
+    ] },
+    "FB Graph — /page/feed":         { "main": [[ { "node": "Normalize response", "type": "main", "index": 0 } ]] },
+    "Zalo OA — manual broadcast stub": { "main": [[ { "node": "Normalize response", "type": "main", "index": 0 } ]] },
+    "OpenClaw → tiktok_post":        { "main": [[ { "node": "Normalize response", "type": "main", "index": 0 } ]] },
+    "Unsupported platform":          { "main": [[ { "node": "Normalize response", "type": "main", "index": 0 } ]] },
+    "Normalize response":            { "main": [[ { "node": "Log + mark outcome", "type": "main", "index": 0 } ]] },
+    "Log + mark outcome":            { "main": [[ { "node": "Route by outcome", "type": "main", "index": 0 } ]] },
+    "Route by outcome":              { "main": [
+        [ { "node": "Telegram alert (failed)", "type": "main", "index": 0 } ],
+        [ { "node": "Telegram notice (manual)", "type": "main", "index": 0 } ],
+        []
+    ] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveManualExecutions": true, "errorWorkflow": "99-error-alert" },
+  "meta": { "templateCredsSetupCompleted": false },
+  "pinData": {}
+}
