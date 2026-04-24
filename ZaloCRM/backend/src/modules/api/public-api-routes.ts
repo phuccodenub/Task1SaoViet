@@ -6,6 +6,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { prisma } from '../../shared/database/prisma-client.js';
 import { logger } from '../../shared/utils/logger.js';
+import { zaloRateLimiter } from '../zalo/zalo-rate-limiter.js';
 
 // ── API key auth middleware ────────────────────────────────────────────────────
 
@@ -145,13 +146,26 @@ export async function publicApiRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/public/conversations', async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       const orgId = (request as any).orgId as string;
-      const { limit = '20' } = request.query as Record<string, string>;
+      const { limit = '20', visibility = 'visible' } = request.query as Record<string, string>;
+
+      // Fix #18: public API must honor the same visibility contract as the
+      // internal REST/socket surface — otherwise API keys/n8n flows can read
+      // hidden/pending conversation bodies that the allowlist intentionally
+      // excludes from CRM workflows. Default 'visible'; callers can opt in to
+      // 'pending'/'hidden'/'all' only if the API key grants it. For now we
+      // accept the explicit opt-in without a finer-grained permission model
+      // (public-api auth already scopes by org) — but default stays tight.
+      const allowedVisibilities = new Set(['visible', 'pending', 'hidden', 'all']);
+      const vis = allowedVisibilities.has(visibility) ? visibility : 'visible';
+      const where: any = { orgId };
+      if (vis !== 'all') where.visibility = vis;
 
       const conversations = await prisma.conversation.findMany({
-        where: { orgId },
+        where,
         select: {
           id: true, threadType: true, externalThreadId: true,
           lastMessageAt: true, unreadCount: true, isReplied: true,
+          visibility: true,
           contact: { select: { id: true, fullName: true, phone: true, avatarUrl: true } },
         },
         orderBy: { lastMessageAt: 'desc' },
@@ -171,8 +185,25 @@ export async function publicApiRoutes(app: FastifyInstance): Promise<void> {
       const { id } = request.params as { id: string };
       const { limit = '50' } = request.query as Record<string, string>;
 
-      const conv = await prisma.conversation.findFirst({ where: { id, orgId }, select: { id: true } });
+      // Fix #18: block reading messages from pending/hidden conversations
+      // over the public API unless the caller already knows visibility and
+      // explicitly opts in via ?includeNonVisible=true. This matches the
+      // semantics of GET /conversations — reading implies the caller has
+      // already decided to surface this thread.
+      const { includeNonVisible = 'false' } = request.query as Record<string, string>;
+      const allowNonVisible = includeNonVisible === 'true';
+
+      const conv = await prisma.conversation.findFirst({
+        where: { id, orgId },
+        select: { id: true, visibility: true },
+      });
       if (!conv) return reply.status(404).send({ error: 'Conversation not found' });
+      if (conv.visibility !== 'visible' && !allowNonVisible) {
+        return reply.status(409).send({
+          error: `Conversation is ${conv.visibility}. Pass ?includeNonVisible=true to read pending/hidden content.`,
+          visibility: conv.visibility,
+        });
+      }
 
       const messages = await prisma.message.findMany({
         where: { conversationId: id, isDeleted: false },
@@ -184,7 +215,7 @@ export async function publicApiRoutes(app: FastifyInstance): Promise<void> {
         },
       });
 
-      return { messages };
+      return { messages, visibility: conv.visibility };
     } catch (err) {
       logger.error('[public-api] GET /conversations/:id/messages error:', err);
       return reply.status(500).send({ error: 'Failed to fetch messages' });
@@ -270,12 +301,42 @@ export async function publicApiRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(422).send({ error: 'Zalo account is not connected' });
       }
 
+      // Fix #14: honor allowlist/visibility contract. If a conversation for
+      // this (account, thread) exists and was marked pending/hidden, refuse
+      // the send — otherwise external API keys / n8n flows could bypass the
+      // 409 block that chat-routes enforces for human users. No conv row
+      // means this is a brand-new outbound send, which is allowed (legacy
+      // behavior preserved for bootstrap flows that seed conversations).
+      const existingConv = await prisma.conversation.findFirst({
+        where: {
+          zaloAccountId: body.zaloAccountId,
+          externalThreadId: body.threadId,
+        },
+        select: { visibility: true },
+      });
+      if (existingConv && existingConv.visibility !== 'visible') {
+        logger.warn(
+          `[public-api] send blocked: account=${body.zaloAccountId} thread=${body.threadId} visibility=${existingConv.visibility}`,
+        );
+        return reply.status(409).send({
+          error: `Conversation is ${existingConv.visibility} — approve/unhide before sending`,
+          visibility: existingConv.visibility,
+        });
+      }
+
       // Dynamically import zaloPool to avoid circular deps
       const { zaloPool } = await import('../zalo/zalo-pool.js');
       const api = zaloPool.getApi(body.zaloAccountId);
       if (!api) return reply.status(422).send({ error: 'Zalo account not active in pool' });
 
       const threadType = body.threadType === 'group' ? 1 : 0;
+      const limits = await zaloRateLimiter.reserveSend(body.zaloAccountId);
+      if (!limits.allowed) {
+        logger.warn(
+          `[public-api] rate limit blocked send for account ${body.zaloAccountId}: ${limits.reason}`,
+        );
+        return reply.status(429).send({ error: limits.reason ?? 'Rate limit exceeded' });
+      }
       await api.sendMessage(body.content, body.threadId, threadType);
 
       return { success: true };

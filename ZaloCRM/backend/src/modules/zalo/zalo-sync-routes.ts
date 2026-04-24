@@ -1,11 +1,16 @@
 /**
  * zalo-sync-routes.ts — Endpoints to sync Zalo friends/contacts to CRM contacts.
- * Requires owner or admin role.
+ *
+ * ACL (Fix #22): this route namespace also lives under /zalo-accounts/:id,
+ * so it must mirror the guards from zalo-routes.ts. Previously only
+ * requireRole was checked, which let an owner/admin who guessed another
+ * org's account UUID pull friends from that account into their own org.
+ * Now: requireZaloAccess('admin') + explicit org-scoped account lookup.
  */
 import type { FastifyInstance } from 'fastify';
 import { prisma } from '../../shared/database/prisma-client.js';
 import { authMiddleware } from '../auth/auth-middleware.js';
-import { requireRole } from '../auth/role-middleware.js';
+import { requireZaloAccess } from './zalo-access-middleware.js';
 import { zaloPool } from './zalo-pool.js';
 import { logger } from '../../shared/utils/logger.js';
 import { randomUUID } from 'node:crypto';
@@ -14,10 +19,20 @@ export async function zaloSyncRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authMiddleware);
 
   // Sync all friends from a Zalo account to contacts
-  app.post('/api/v1/zalo-accounts/:id/sync-contacts', { preHandler: requireRole('owner', 'admin') },
+  app.post('/api/v1/zalo-accounts/:id/sync-contacts', { preHandler: requireZaloAccess('admin') },
     async (request, reply) => {
       const user = request.user!;
       const { id } = request.params as { id: string };
+
+      // Verify the account actually belongs to the caller's org BEFORE
+      // touching the pool. Without this, requireZaloAccess short-circuits
+      // owner/admin through without a cross-org guard, and the syncing
+      // would write another org's friends into user.orgId contacts.
+      const account = await prisma.zaloAccount.findFirst({
+        where: { id, orgId: user.orgId },
+        select: { id: true },
+      });
+      if (!account) return reply.status(404).send({ error: 'Account not found' });
 
       const instance = zaloPool.getInstance(id);
       if (!instance?.api) return reply.status(400).send({ error: 'Zalo account not connected' });

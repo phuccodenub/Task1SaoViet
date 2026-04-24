@@ -100,11 +100,16 @@ class ZaloAccountPool {
       } catch {}
 
       this.attachListener(accountId, api);
-      this.io?.emit('zalo:connected', { accountId, zaloUid: ownId });
       await this.updateAccountDB(accountId, 'connected', ownId);
-      // Emit webhook (orgId lookup is async, fire-and-forget)
+      // Fix #23: account-specific lifecycle → account room only. The webhook
+      // still fires at org scope because it's a backend integration channel,
+      // not a broadcast to every org member's browser.
+      this.io?.to(`account:${accountId}`).emit('zalo:connected', { accountId, zaloUid: ownId });
       prisma.zaloAccount.findUnique({ where: { id: accountId }, select: { orgId: true } })
-        .then((rec) => rec && emitWebhook(rec.orgId, 'zalo.connected', { accountId }))
+        .then((rec) => {
+          if (!rec) return;
+          emitWebhook(rec.orgId, 'zalo.connected', { accountId });
+        })
         .catch(() => {});
 
       // Fire-and-forget: link orphaned conversations on login
@@ -114,7 +119,8 @@ class ZaloAccountPool {
     } catch (err) {
       const instance = this.instances.get(accountId);
       if (instance) instance.status = 'disconnected';
-      this.io?.emit('zalo:error', { accountId, error: String(err) });
+      // QR-login error → account room (Fix #23)
+      this.io?.to(`account:${accountId}`).emit('zalo:error', { accountId, error: String(err) });
       throw err;
     }
   }
@@ -154,9 +160,17 @@ class ZaloAccountPool {
 
       this.attachListener(accountId, api);
       await this.updateAccountDB(accountId, 'connected', ownId);
-      this.io?.emit('zalo:connected', { accountId, zaloUid: ownId });
       prisma.zaloAccount.findUnique({ where: { id: accountId }, select: { orgId: true } })
-        .then((rec) => rec && emitWebhook(rec.orgId, 'zalo.connected', { accountId }))
+        .then((rec) => {
+          if (!rec) return;
+          // Fix #23: emit to account room (access-gated) instead of org room.
+          // accountId + zaloUid are metadata that members without account
+          // access should not be able to observe. Webhook still fires at
+          // org level because it's a backend→external integration, not a
+          // user-visible channel.
+          this.io?.to(`account:${accountId}`).emit('zalo:connected', { accountId, zaloUid: ownId });
+          emitWebhook(rec.orgId, 'zalo.connected', { accountId });
+        })
         .catch(() => {});
 
       // Fire-and-forget: link orphaned conversations on reconnect
@@ -167,7 +181,8 @@ class ZaloAccountPool {
       const instance = this.instances.get(accountId);
       if (instance) instance.status = 'disconnected';
       await this.updateAccountDB(accountId, 'qr_pending', null);
-      this.io?.emit('zalo:reconnect-failed', { accountId, error: String(err) });
+      // reconnect-failed → account room (Fix #23)
+      this.io?.to(`account:${accountId}`).emit('zalo:reconnect-failed', { accountId, error: String(err) });
     }
   }
 
@@ -199,7 +214,10 @@ class ZaloAccountPool {
           // >5 disconnects in 5 min → stop reconnecting, require QR re-login
           logger.error(`[zalo:${id}] Circuit breaker: ${history.length} disconnects in 5 min — stopping auto-reconnect. QR re-login required.`);
           this.updateAccountDB(id, 'qr_pending', null);
-          this.io?.emit('zalo:reconnect-failed', { accountId: id, error: 'Session không ổn định, cần đăng nhập QR lại' });
+          // Fix #23: account-specific → account room only
+          this.io?.to(`account:${id}`).emit('zalo:reconnect-failed', {
+            accountId: id, error: 'Session không ổn định, cần đăng nhập QR lại',
+          });
           this.disconnectHistory.delete(key);
           return; // DON'T reconnect
         }
@@ -253,7 +271,11 @@ class ZaloAccountPool {
         await this.reconnect(accountId, session);
       } else {
         logger.warn(`[zalo:${accountId}] No saved session, cannot auto-reconnect`);
-        this.io?.emit('zalo:reconnect-failed', { accountId, error: 'No saved session' });
+        // Scope to org room
+        // Fix #23: account-specific → account room only
+        this.io?.to(`account:${accountId}`).emit('zalo:reconnect-failed', {
+          accountId, error: 'No saved session',
+        });
       }
     } catch (err) {
       logger.error(`[zalo:${accountId}] Auto-reconnect failed:`, err);

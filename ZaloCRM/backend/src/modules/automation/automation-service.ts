@@ -4,6 +4,7 @@ import { assignUserAction } from './actions/assign-user-action.js';
 import { updateStatusAction } from './actions/update-status-action.js';
 import { createAppointmentAction } from './actions/create-appointment-action.js';
 import { sendTemplateAction } from './actions/send-template-action.js';
+import { callWebhookAction } from './actions/call-webhook-action.js';
 
 export type AutomationTriggerType = 'message_received' | 'contact_created' | 'status_changed';
 
@@ -17,7 +18,15 @@ type AutomationAction =
   | { type: 'assign_user'; userId: string }
   | { type: 'send_template'; templateId: string }
   | { type: 'update_status'; status: string }
-  | { type: 'create_appointment'; offsetHours?: number; typeLabel?: string; notes?: string };
+  | { type: 'create_appointment'; offsetHours?: number; typeLabel?: string; notes?: string }
+  | {
+      type: 'call_webhook';
+      url: string;
+      secret?: string;
+      headers?: Record<string, string>;
+      timeoutMs?: number;
+      payload?: Record<string, unknown>;
+    };
 
 export interface AutomationContext {
   trigger: AutomationTriggerType;
@@ -99,6 +108,24 @@ function getFieldValue(field: string, context: AutomationContext): unknown {
 }
 
 async function executeAction(action: AutomationAction, context: AutomationContext): Promise<void> {
+  if (action.type === 'call_webhook' && action.url) {
+    callWebhookAction({
+      orgId: context.orgId,
+      url: action.url,
+      secret: action.secret ?? null,
+      headers: action.headers ?? null,
+      timeoutMs: action.timeoutMs,
+      payload: {
+        ...(action.payload ?? {}),
+        trigger: context.trigger,
+        contact: context.contact ?? null,
+        conversation: context.conversation ?? null,
+        message: context.message ?? null,
+      },
+    });
+    return;
+  }
+
   if (!context.contact?.id) return;
 
   if (action.type === 'assign_user' && action.userId) {

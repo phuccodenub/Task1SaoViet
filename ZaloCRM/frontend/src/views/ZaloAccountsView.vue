@@ -3,7 +3,9 @@
     <div class="d-flex align-center mb-4">
       <h1 class="text-h4">Tài khoản Zalo</h1>
       <v-spacer />
-      <v-btn color="primary" prepend-icon="mdi-plus" @click="showAddDialog = true">Thêm Zalo</v-btn>
+      <!-- Fix #25: Add account is owner/admin only on the backend; hide
+           the trigger from members so they don't get a 403 toast. -->
+      <v-btn v-if="authStore.isAdmin" color="primary" prepend-icon="mdi-plus" @click="showAddDialog = true">Thêm Zalo</v-btn>
     </div>
 
     <v-card>
@@ -17,18 +19,52 @@
           <v-btn v-if="authStore.isAdmin" icon size="small" color="cyan" title="Phân quyền truy cập" @click="openAccess(item)">
             <v-icon>mdi-shield-account</v-icon>
           </v-btn>
-          <v-btn icon size="small" color="success" @click="syncContacts(item.id)" title="Đồng bộ danh bạ Zalo" :loading="syncing === item.id">
-            <v-icon>mdi-account-sync</v-icon>
+          <!-- Allowlist management — requireZaloAccess('chat') on backend, so
+               member with chat permission can use it; `canAdmin(item)` mirrors
+               admin-level UI gate for all other destructive actions. -->
+          <v-btn
+            icon
+            size="small"
+            color="purple"
+            title="Quản lý hội thoại (allowlist)"
+            @click="$router.push(`/zalo-accounts/${item.id}/allowlist`)"
+          >
+            <v-icon>mdi-filter-variant</v-icon>
           </v-btn>
-          <v-btn v-if="item.liveStatus !== 'connected'" icon size="small" color="primary" @click="loginAccount(item.id)" title="Đăng nhập QR">
-            <v-icon>mdi-qrcode</v-icon>
+          <!-- Round 12 P2: wizard must be admin-only. AllowlistWizardDialog.finish
+               always calls PATCH /ingest-policy which is owner/admin-only on
+               the backend — without this gate, a chat-only member opening the
+               wizard would hit a silent 403 on completion. Member-chat can
+               still manage allowlist entries through the 🔽 "Quản lý hội thoại"
+               button above (that endpoint accepts requireZaloAccess('chat')). -->
+          <v-btn
+            v-if="authStore.isAdmin"
+            icon
+            size="small"
+            color="teal"
+            title="Mở wizard cài đặt hội thoại"
+            @click="openWizard(item)"
+          >
+            <v-icon>mdi-wizard-hat</v-icon>
           </v-btn>
-          <v-btn v-if="item.liveStatus === 'disconnected' && item.sessionData" icon size="small" color="info" @click="reconnectAccount(item.id)" title="Kết nối lại">
-            <v-icon>mdi-refresh</v-icon>
-          </v-btn>
-          <v-btn icon size="small" color="error" @click="confirmDelete(item)" title="Xóa">
-            <v-icon>mdi-delete</v-icon>
-          </v-btn>
+          <!-- Fix #25: every action below requires admin permission on the
+               specific account. requireZaloAccess('admin') on the backend
+               accepts owner/admin role OR ownerUserId match (Fix #24).
+               Members will see no buttons unless they own the account. -->
+          <template v-if="canAdmin(item)">
+            <v-btn icon size="small" color="success" @click="syncContacts(item.id)" title="Đồng bộ danh bạ Zalo" :loading="syncing === item.id">
+              <v-icon>mdi-account-sync</v-icon>
+            </v-btn>
+            <v-btn v-if="item.liveStatus !== 'connected'" icon size="small" color="primary" @click="loginAccount(item.id)" title="Đăng nhập QR">
+              <v-icon>mdi-qrcode</v-icon>
+            </v-btn>
+            <v-btn v-if="item.liveStatus === 'disconnected' && item.sessionData" icon size="small" color="info" @click="reconnectAccount(item.id)" title="Kết nối lại">
+              <v-icon>mdi-refresh</v-icon>
+            </v-btn>
+            <v-btn icon size="small" color="error" @click="confirmDelete(item)" title="Xóa">
+              <v-icon>mdi-delete</v-icon>
+            </v-btn>
+          </template>
         </template>
       </v-data-table>
     </v-card>
@@ -93,6 +129,15 @@
       :account-id="accessTarget?.id ?? ''"
       :account-name="accessTarget?.displayName ?? accessTarget?.id ?? ''"
     />
+
+    <!-- Allowlist onboarding wizard — auto-opens for newly-connected accounts
+         and is also reachable from the row action menu ("Mở wizard"). -->
+    <AllowlistWizardDialog
+      v-model="showWizard"
+      :account-id="wizardTarget?.id ?? ''"
+      :account-name="wizardTarget?.displayName ?? wizardTarget?.id ?? null"
+      @completed="onWizardCompleted"
+    />
   </div>
 </template>
 
@@ -101,6 +146,7 @@ import { ref, onMounted } from 'vue';
 import { useZaloAccounts, type ZaloAccount } from '@/composables/use-zalo-accounts';
 import { useAuthStore } from '@/stores/auth';
 import ZaloAccessDialog from '@/components/settings/ZaloAccessDialog.vue';
+import AllowlistWizardDialog from '@/components/zalo/AllowlistWizardDialog.vue';
 import { api } from '@/api/index';
 
 const {
@@ -108,18 +154,29 @@ const {
   showQRDialog, qrImage, qrScanned, scannedName, qrError,
   statusColor, statusText,
   fetchAccounts, addAccount, loginAccount, reconnectAccount, deleteAccount,
-  cancelQR, setupSocket,
+  cancelQR, setupSocket, onAccountConnected,
 } = useZaloAccounts();
 
 const authStore = useAuthStore();
+
+// Fix #25: gate admin-level account actions to mirror backend
+// requireZaloAccess('admin'). Owner/admin role bypasses; member only
+// passes when ownerUserId matches (legacy account fallback handled
+// server-side too).
+function canAdmin(item: any): boolean {
+  if (authStore.isAdmin) return true;
+  return item?.owner?.id === authStore.user?.id;
+}
 
 const showAddDialog = ref(false);
 const syncing = ref<string | null>(null);
 const showDeleteDialog = ref(false);
 const showAccessDialog = ref(false);
+const showWizard = ref(false);
 const newAccountName = ref('');
 const deleteTarget = ref<ZaloAccount | null>(null);
 const accessTarget = ref<ZaloAccount | null>(null);
+const wizardTarget = ref<ZaloAccount | null>(null);
 
 const headers = [
   { title: 'Tên', key: 'displayName', sortable: true },
@@ -159,6 +216,17 @@ function openAccess(account: ZaloAccount) {
   showAccessDialog.value = true;
 }
 
+function openWizard(account: ZaloAccount) {
+  wizardTarget.value = account;
+  showWizard.value = true;
+}
+
+function onWizardCompleted() {
+  // Refresh the list so any policy/allowlist changes reflect in status cells
+  // right away. The wizard itself already persists state.
+  fetchAccounts();
+}
+
 async function handleDeleteAccount() {
   if (!deleteTarget.value) return;
   const ok = await deleteAccount(deleteTarget.value);
@@ -167,6 +235,31 @@ async function handleDeleteAccount() {
     deleteTarget.value = null;
   }
 }
+
+// Auto-open the onboarding wizard once per account. Registered at setup
+// scope (not inside onMounted) so `onAccountConnected`'s internal
+// `onUnmounted` teardown hooks up cleanly with this component's lifecycle
+// regardless of when fetchAccounts/setupSocket run. Routes through the
+// composable helper so we do NOT add a second `socket.on('zalo:connected')`
+// in this view — Codex round 6 flagged how easily that drifts when
+// backend rooms change scope.
+//
+// Round 12 P2: gate on authStore.isAdmin because the wizard's finish step
+// patches ingestPolicy (owner/admin-only). Auto-opening it for members
+// would end in a 403 no matter what they pick.
+onAccountConnected((accountId) => {
+  if (!authStore.isAdmin) return;
+  const flagKey = `zalocrm:wizard-shown:${accountId}`;
+  if (localStorage.getItem(flagKey)) return;
+  // Wait briefly so fetchAccounts() (also triggered by the composable on
+  // this event) has populated the row the wizard needs for account name.
+  setTimeout(() => {
+    const account = accounts.value.find((a) => a.id === accountId);
+    if (!account) return;
+    wizardTarget.value = account;
+    showWizard.value = true;
+  }, 300);
+});
 
 onMounted(() => {
   fetchAccounts();

@@ -47,6 +47,53 @@
 
 > ⚠️ **Lưu ý:** KHÔNG mở Zalo Web trên trình duyệt khi đang dùng hệ thống
 
+### Quản lý hội thoại Zalo (allowlist — v2.2)
+
+Mặc định ZaloCRM đồng bộ mọi hội thoại vào CRM (giống v2.1). Nếu muốn **chọn hội thoại nào sync** để tách tin riêng tư khỏi CRM, dùng tính năng allowlist:
+
+**Wizard tự động sau khi kết nối Zalo mới**
+
+Sau khi quét QR lần đầu cho 1 tài khoản, hệ thống tự mở dialog **"Cài đặt hội thoại Zalo"** 3 bước:
+
+1. Chọn chính sách: "Chỉ đồng bộ hội thoại tôi chọn" (khuyến nghị) hoặc "Đồng bộ tất cả".
+2. (Nếu chọn allowlist) Tick bạn bè / nhóm muốn sync. Mặc định tick sẵn những hội thoại đã có trong CRM.
+3. Xác nhận.
+
+Có thể **mở lại wizard** bất cứ lúc nào bằng biểu tượng 🧙 trong hàng tài khoản.
+
+**Quản lý allowlist thường xuyên**
+
+Biểu tượng 🔽 **"Quản lý hội thoại"** trong hàng tài khoản Zalo dẫn đến trang `/zalo-accounts/<id>/allowlist` với 3 tab:
+
+- **Bạn bè** — checkbox chọn từng bạn (có ô tìm kiếm + nút "Chọn tất/Bỏ chọn").
+- **Nhóm** — tương tự với nhóm chat.
+- **Chờ duyệt** — hội thoại đến từ thread không có trong allowlist. Bấm **Duyệt** → chuyển sang tab chính + thêm vào allowlist. Bấm **Bỏ qua** → ẩn (vẫn lưu trong DB để analytics).
+
+Bấm **Lưu thay đổi** để áp diff. Khi bỏ tick 1 hội thoại đã có trong CRM, hệ thống tự ẩn hội thoại đó (không xóa dữ liệu).
+
+**Tab "Chờ duyệt" trong khung Chat**
+
+Trong trang `/chat`, khi có hội thoại pending sẽ xuất hiện tab **"Chờ duyệt (N)"** bên cạnh "Chính" và "Khác". Mỗi dòng có 2 nút inline (✓ Duyệt / ✗ Bỏ qua) — xử lý nhanh không cần vào trang riêng.
+
+**Ai có quyền gì?**
+
+| Hành động | Quyền yêu cầu |
+|---|---|
+| Xem allowlist, duyệt/từ chối, thêm bỏ thread | `chat` trên tài khoản Zalo |
+| Đổi chính sách (all ↔ allowlist) | `owner` hoặc `admin` của org |
+
+Chi tiết kỹ thuật: [docs/feature-conversation-allowlist.md](docs/feature-conversation-allowlist.md).
+
+### Tải lịch sử chat cũ (v2.2)
+
+Trong khung chat, phía trên tin nhắn cũ nhất có banner **"Tải thêm tin cũ"**. Bấm để kéo thêm tin cũ hơn:
+
+- **Nhóm**: hệ thống sẽ gọi Zalo API lấy cửa sổ gần đây. Lưu ý — Zalo chỉ trả 1 cửa sổ, không có phân trang cursor. Banner sẽ nói rõ "Zalo chỉ trả cửa sổ gần đây nhất; tin đã lưu sẽ được bỏ qua" hoặc "Zalo báo không còn lịch sử cũ hơn".
+- **1-1 (cá nhân)**: chưa hỗ trợ fetch từ Zalo (đang R&D). Banner hiển thị dòng "Hội thoại 1-1 chưa hỗ trợ lấy lịch sử cũ".
+- Mọi thread đã lưu trong CRM có thể cursor-scroll cũ dần về quá khứ, không gọi Zalo.
+
+Chi tiết kỹ thuật + giới hạn: [docs/feature-chat-history-fetch.md](docs/feature-chat-history-fetch.md).
+
 ---
 
 ## 3. Chat với khách hàng

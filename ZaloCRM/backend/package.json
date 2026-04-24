@@ -4,10 +4,14 @@
   "description": "Zalo Sales CRM Backend API",
   "main": "dist/app.js",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "tsx watch src/app.ts",
     "build": "tsc",
     "start": "node dist/app.js",
+    "typecheck": "tsc --noEmit",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:seed": "tsx prisma/seed.ts",
@@ -33,7 +37,7 @@
     "bcryptjs": "^3.0.3",
     "exceljs": "^4.4.0",
     "fastify": "^5.8.4",
-    "jsonwebtoken": "^9.0.3",
+    "ioredis": "^5.4.1",
     "node-cron": "^4.2.1",
     "pg": "^8.20.0",
     "socket.io": "^4.8.3",
@@ -42,7 +46,6 @@
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
-    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^25.5.0",
     "@types/node-cron": "^3.0.11",
     "@types/uuid": "^10.0.0",

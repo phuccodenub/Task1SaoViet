@@ -68,6 +68,7 @@ model User {
   repliedMessages  Message[]           @relation("RepliedMessages")
   activityLogs     ActivityLog[]
   messageTemplates MessageTemplate[]
+  allowlistEntries ZaloThreadAllowlist[] @relation("AllowlistAddedBy")
 
   @@map("users")
 }
@@ -84,13 +85,19 @@ model ZaloAccount {
   status          String    @default("disconnected") // connected, disconnected, qr_pending
   sessionData     Json?     @map("session_data")
   lastConnectedAt DateTime? @map("last_connected_at")
+  // Ingest policy for incoming Zalo messages:
+  //   'all'       = persist every conversation (backward-compat default for v2.1 accounts)
+  //   'allowlist' = only threads listed in ZaloThreadAllowlist become 'visible';
+  //                 others land as 'pending' waiting for user review
+  ingestPolicy    String    @default("all") @map("ingest_policy")
   createdAt       DateTime  @default(now()) @map("created_at")
 
-  org           Organization        @relation(fields: [orgId], references: [id], onDelete: Cascade)
-  owner         User                @relation(fields: [ownerUserId], references: [id])
+  org           Organization          @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  owner         User                  @relation(fields: [ownerUserId], references: [id])
   access        ZaloAccountAccess[]
   conversations Conversation[]
   dailyStats    DailyMessageStat[]
+  allowlist     ZaloThreadAllowlist[]
 
   @@map("zalo_accounts")
 }
@@ -160,6 +167,18 @@ model Conversation {
   unreadCount      Int       @default(0) @map("unread_count")
   isReplied        Boolean   @default(true) @map("is_replied")
   tab              String    @default("main") @map("tab") // main, other
+  // Visibility lifecycle:
+  //   'visible' = shown in normal chat UI (default for legacy rows + allow-listed threads)
+  //   'pending' = thread arrived while account is in 'allowlist' policy and is not yet approved
+  //   'hidden'  = explicitly rejected by a user; data retained for analytics but excluded from default lists
+  visibility       String    @default("visible") @map("visibility")
+  hiddenAt         DateTime? @map("hidden_at")
+  hiddenByUserId   String?   @map("hidden_by_user_id")
+  reviewedAt       DateTime? @map("reviewed_at")
+  reviewedByUserId String?   @map("reviewed_by_user_id")
+  // History backfill tracking — used by /fetch-history endpoint to know when to stop
+  oldestMessageAt  DateTime? @map("oldest_message_at")
+  historyExhausted Boolean   @default(false) @map("history_exhausted")
   createdAt        DateTime  @default(now()) @map("created_at")
 
   org           Organization  @relation(fields: [orgId], references: [id], onDelete: Cascade)
@@ -172,6 +191,7 @@ model Conversation {
   @@index([orgId, zaloAccountId, isReplied, lastMessageAt])
   @@index([orgId, zaloAccountId, lastMessageAt])
   @@index([orgId, tab, lastMessageAt])
+  @@index([orgId, visibility, lastMessageAt])
   @@map("conversations")
 }
 
@@ -409,4 +429,27 @@ model AiSuggestion {
   @@index([conversationId, createdAt])
   @@index([orgId, type, createdAt])
   @@map("ai_suggestions")
+}
+
+// Per-account allowlist of external Zalo threads (user UIDs or group IDs).
+// Only consulted when ZaloAccount.ingestPolicy = 'allowlist'.
+// Threads not in this list (or with enabled=false) cause new conversations
+// to be created with visibility='pending' instead of 'visible'.
+model ZaloThreadAllowlist {
+  id               String   @id @default(uuid())
+  zaloAccountId    String   @map("zalo_account_id")
+  externalThreadId String   @map("external_thread_id")
+  threadType       String   @map("thread_type") // user | group
+  enabled          Boolean  @default(true)
+  addedByUserId    String   @map("added_by_user_id")
+  note             String?
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  zaloAccount ZaloAccount @relation(fields: [zaloAccountId], references: [id], onDelete: Cascade)
+  addedBy     User        @relation("AllowlistAddedBy", fields: [addedByUserId], references: [id])
+
+  @@unique([zaloAccountId, externalThreadId])
+  @@index([zaloAccountId, enabled])
+  @@map("zalo_thread_allowlist")
 }

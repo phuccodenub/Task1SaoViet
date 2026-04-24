@@ -37,6 +37,19 @@ export function requireZaloAccess(minPermission: Permission) {
     if (!zaloAccountId) return reply.status(404).send({ error: 'Not found' });
 
     try {
+      // Owner of the account (ZaloAccount.ownerUserId) counts as having
+      // admin-level access to it, even without an explicit ZaloAccountAccess
+      // row. This covers legacy accounts created before Fix #15 started
+      // emitting access rows automatically, AND matches the socket layer
+      // which already treats ownerUserId as privileged. Without this, a
+      // member can see their legacy-owned account in the REST list (Fix #20)
+      // but get 403 on every action (Fix #24 callout from Codex).
+      const account = await prisma.zaloAccount.findFirst({
+        where: { id: zaloAccountId, orgId: user.orgId },
+        select: { ownerUserId: true },
+      });
+      if (account?.ownerUserId === user.id) return;
+
       const access = await prisma.zaloAccountAccess.findFirst({
         where: { zaloAccountId, userId: user.id },
       });

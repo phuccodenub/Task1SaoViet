@@ -8,6 +8,61 @@ import { logger } from '../../shared/utils/logger.js';
 import { handleIncomingMessage, handleMessageUndo } from '../chat/message-handler.js';
 import { detectContentType, updateContactAvatar } from './zalo-message-helpers.js';
 
+// Note: after Fix #23 all account-specific socket events emit to
+// `account:<id>` rooms, so the previous `resolveAccountOrgId` helper and
+// its per-account cache are no longer needed.
+
+/**
+ * Emit chat:message with payload that respects visibility AND per-account ACL
+ * (Fix #9 + Fix #13 + Fix #19):
+ *   - visible → full payload sent to `account:<id>` room. Members joined this
+ *               room only after passing ZaloAccountAccess in zalo-socket.ts,
+ *               so message content stays within the account's ACL — same
+ *               boundary the REST list endpoint enforces via requireZaloAccess.
+ *   - pending → envelope sent to `account:<id>` room too (NOT org room),
+ *               because an org-wide pending broadcast would let members
+ *               without per-account access discover that account X received a
+ *               message at time T — metadata leak even without content.
+ *               Payload is stripped to `{accountId, visibility}` only: the
+ *               counter in the UI is per-account, so the client refetches
+ *               `/conversations/counts?accountId=X` on this event. No
+ *               conversationId/messageId/sentAt crosses the boundary.
+ *   - hidden  → no emit at all.
+ */
+function emitChatMessage(
+  io: Server | null,
+  accountId: string,
+  result: {
+    orgId: string;
+    message: { id: string; sentAt: Date };
+    conversationId: string;
+    visibility: 'visible' | 'pending' | 'hidden';
+  },
+): void {
+  if (!io) return;
+  if (result.visibility === 'hidden') return; // fully muted
+
+  const room = `account:${accountId}`;
+
+  if (result.visibility === 'pending') {
+    // Minimal badge-invalidation signal — no conv/message identifiers leak
+    // outside the account ACL boundary. UI refetches counts on receipt.
+    io.to(room).emit('chat:message', {
+      accountId,
+      visibility: 'pending',
+    });
+    return;
+  }
+
+  // Full payload only for visible messages
+  io.to(room).emit('chat:message', {
+    accountId,
+    message: result.message,
+    conversationId: result.conversationId,
+    visibility: 'visible',
+  });
+}
+
 // Cached user info entry with 5-minute TTL
 export interface UserInfoCacheEntry {
   zaloName: string;
@@ -134,11 +189,7 @@ export function attachZaloListener(ctx: ListenerContext): void {
       });
 
       if (result) {
-        io?.emit('chat:message', {
-          accountId,
-          message: result.message,
-          conversationId: result.conversationId,
-        });
+        emitChatMessage(io, accountId, result);
       }
     } catch (err) {
       logger.error(`[zalo:${accountId}] Message handler error:`, err);
@@ -149,7 +200,8 @@ export function attachZaloListener(ctx: ListenerContext): void {
     const msgId = data.data?.msgId || data.msgId;
     if (msgId) {
       await handleMessageUndo(accountId, String(msgId));
-      io?.emit('chat:deleted', { accountId, msgId: String(msgId) });
+      // Fix #23: account-specific → account room only
+      io?.to(`account:${accountId}`).emit('chat:deleted', { accountId, msgId: String(msgId) });
     }
   });
 
@@ -196,11 +248,7 @@ export function attachZaloListener(ctx: ListenerContext): void {
         });
 
         if (result) {
-          io?.emit('chat:message', {
-            accountId,
-            message: result.message,
-            conversationId: result.conversationId,
-          });
+          emitChatMessage(io, accountId, result);
         }
       } catch (err) {
         logger.warn(`[zalo:${accountId}] old_messages processing error:`, err);
@@ -230,7 +278,8 @@ export function attachZaloListener(ctx: ListenerContext): void {
   listener.on('closed', (code: number, reason: string) => {
     logger.warn(`[zalo:${accountId}] Listener closed: ${code} ${reason}`);
     onDisconnected(accountId);
-    io?.emit('zalo:disconnected', { accountId, code, reason });
+    // Fix #23: account-specific → account room only
+    io?.to(`account:${accountId}`).emit('zalo:disconnected', { accountId, code, reason });
   });
 
   listener.on('error', (err: any) => {

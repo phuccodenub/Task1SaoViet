@@ -27,11 +27,26 @@
       />
     </div>
 
-    <!-- Tab switcher: Main / Other -->
+    <!-- Tab switcher: Main / Other / (Pending when count > 0) -->
     <div class="d-flex px-2 pb-1">
       <v-btn-toggle v-model="activeTab" mandatory density="compact" color="primary" class="w-100">
         <v-btn value="main" size="small" class="flex-grow-1">Chính</v-btn>
         <v-btn value="other" size="small" class="flex-grow-1">Khác</v-btn>
+        <v-btn
+          v-if="counts.pending > 0"
+          value="pending"
+          size="small"
+          class="flex-grow-1"
+          color="warning"
+        >
+          Chờ duyệt
+          <v-badge
+            :content="counts.pending > 99 ? '99+' : counts.pending"
+            color="warning"
+            inline
+            class="ml-1"
+          />
+        </v-btn>
       </v-btn-toggle>
     </div>
 
@@ -213,14 +228,45 @@
 
         <!-- Zalo account indicator -->
         <template #append>
-          <span v-if="conv.zaloAccount?.displayName" class="text-caption text-grey-darken-1 ml-1" style="font-size: 0.65rem; max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+          <!-- Pending tab: inline approve / reject actions so the user can
+               triage without leaving the list. Backend already scoped to
+               requireZaloAccess('chat'), so a 403 here means the UI should
+               hide the buttons — but the list query itself is already
+               filtered by the same ACL so this is defense-in-depth only. -->
+          <div v-if="activeTab === 'pending'" class="d-flex flex-column gap-1 ml-1">
+            <v-btn
+              icon
+              size="x-small"
+              color="success"
+              variant="tonal"
+              :loading="approvingId === conv.id"
+              :disabled="busyId !== null && busyId !== conv.id"
+              title="Duyệt"
+              @click.stop="$emit('approve', conv.id)"
+            >
+              <v-icon size="16">mdi-check</v-icon>
+            </v-btn>
+            <v-btn
+              icon
+              size="x-small"
+              color="error"
+              variant="tonal"
+              :loading="rejectingId === conv.id"
+              :disabled="busyId !== null && busyId !== conv.id"
+              title="Bỏ qua"
+              @click.stop="$emit('reject', conv.id)"
+            >
+              <v-icon size="16">mdi-close</v-icon>
+            </v-btn>
+          </div>
+          <span v-else-if="conv.zaloAccount?.displayName" class="text-caption text-grey-darken-1 ml-1" style="font-size: 0.65rem; max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
             {{ conv.zaloAccount.displayName }}
           </span>
         </template>
       </v-list-item>
 
       <div v-if="!loading && conversations.length === 0" class="text-center pa-8 text-grey">
-        Chưa có cuộc trò chuyện nào
+        {{ activeTab === 'pending' ? 'Không có hội thoại nào đang chờ duyệt' : 'Chưa có cuộc trò chuyện nào' }}
       </div>
     </v-list>
 
@@ -256,11 +302,23 @@ import type { Conversation, AiSentiment } from '@/composables/use-chat';
 import { api } from '@/api/index';
 import AiSentimentBadge from '@/components/ai/ai-sentiment-badge.vue';
 
-defineProps<{
+const props = defineProps<{
   conversations: Conversation[];
   selectedId: string | null;
   loading: boolean;
   search: string;
+  /** Parent may pass in currently-approving/rejecting ids so the inline
+   *  pending buttons reflect in-flight state across both the list and any
+   *  popup. Optional; when absent the UI simply shows no loading spinner. */
+  approvingId?: string | null;
+  rejectingId?: string | null;
+  /** Source-of-truth counts from the parent composable. When provided, the
+   *  list mirrors these values instead of running its own fetch — this is
+   *  what lets socket-driven pending events (fetched in `use-chat`) flip
+   *  the "Chờ duyệt" tab on without waiting for a mount/filter change.
+   *  Omitted → the list falls back to its legacy internal fetch so any
+   *  non-chat consumer of ConversationList keeps working. */
+  externalCounts?: { unread: number; unreplied: number; total: number; pending: number } | null;
 }>();
 
 const emit = defineEmits<{
@@ -270,10 +328,16 @@ const emit = defineEmits<{
   'update:filters': [params: Record<string, string>];
   'tab-changed': [tab: string];
   'conversation-moved': [id: string, tab: string];
+  approve: [id: string];
+  reject: [id: string];
 }>();
 
 // ── Tab state ──────────────────────────────────────────────────────────────
 const activeTab = ref('main');
+
+// Lock other rows while one approve/reject is in flight to avoid surprising
+// the user with two simultaneous optimistic removals.
+const busyId = computed(() => props.approvingId ?? props.rejectingId ?? null);
 
 // ── Context menu state ─────────────────────────────────────────────────────
 const contextMenu = reactive({
@@ -296,7 +360,7 @@ const filters = reactive({
   tags: [] as string[],
 });
 
-const counts = reactive({ unread: 0, unreplied: 0, total: 0 });
+const counts = reactive({ unread: 0, unreplied: 0, total: 0, pending: 0 });
 const availableTags = ref<string[]>([]);
 const showDateMenu = ref(false);
 const showTagMenu = ref(false);
@@ -343,7 +407,14 @@ function buildFilterParams(): Record<string, string> {
   if (filters.from) params.from = filters.from;
   if (filters.to) params.to = filters.to;
   if (filters.tags.length > 0) params.tags = filters.tags.join(',');
-  params.tab = activeTab.value;
+  // Pending tab rides the visibility filter rather than the main/other tab
+  // column (pending convs aren't placed in either tab yet). Leaving `tab`
+  // unset prevents the backend from accidentally requiring tab='pending'.
+  if (activeTab.value === 'pending') {
+    params.visibility = 'pending';
+  } else {
+    params.tab = activeTab.value;
+  }
   return params;
 }
 
@@ -366,18 +437,55 @@ async function moveConversation(convId: string, targetTab: string) {
 }
 
 // ── Counts fetch ────────────────────────────────────────────────────────────
+// Round 12 P2: when the parent supplies `externalCounts`, we mirror that
+// into the local reactive object on every change and skip the internal
+// fetch entirely. That lets socket-driven pending updates from `use-chat`
+// flip the "Chờ duyệt" tab badge without waiting for a mount or filter
+// change. Without an external source the legacy fetch still runs so older
+// callers of ConversationList keep working unchanged.
 async function fetchCounts() {
+  if (props.externalCounts) return;
   try {
-    const params: Record<string, string> = { tab: activeTab.value };
+    const params: Record<string, string> = {};
+    if (activeTab.value !== 'pending') params.tab = activeTab.value;
     if (selectedAccountId.value) params.accountId = selectedAccountId.value;
     const res = await api.get('/conversations/counts', { params });
     counts.unread = res.data.unread ?? 0;
     counts.unreplied = res.data.unreplied ?? 0;
     counts.total = res.data.total ?? 0;
+    // Pending is counted separately (visibility='pending', tab filter ignored
+    // server-side) so it's always accurate no matter which tab we're viewing.
+    counts.pending = res.data.pending ?? 0;
   } catch {
     // Non-critical — badges just won't show counts
   }
 }
+
+watch(
+  () => props.externalCounts,
+  (v) => {
+    if (!v) return;
+    counts.unread = v.unread ?? 0;
+    counts.unreplied = v.unreplied ?? 0;
+    counts.total = v.total ?? 0;
+    counts.pending = v.pending ?? 0;
+    // Round 13 P3 #1: if the pending tab button is about to disappear via
+    // `v-if="counts.pending > 0"` while it is still the active tab, the user
+    // would be stranded on an invisible tab that keeps emitting
+    // `visibility=pending` and showing an empty list. Fall back to 'main' so
+    // the filter resets and the standard conversation list returns.
+    if (counts.pending <= 0 && activeTab.value === 'pending') {
+      activeTab.value = 'main';
+    }
+  },
+  { immediate: true, deep: true },
+);
+
+// Expose to parent so it can refresh counts after an approve/reject round
+// without waiting for the next polling cycle. When `externalCounts` is set
+// the parent should call its own composable refresh instead; this remains
+// as a compat surface for legacy callers that embed the list standalone.
+defineExpose({ fetchCounts });
 
 // ── Available tags fetch ────────────────────────────────────────────────────
 async function fetchAvailableTags() {

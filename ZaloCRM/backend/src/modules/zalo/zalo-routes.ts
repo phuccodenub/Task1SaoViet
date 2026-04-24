@@ -1,9 +1,22 @@
 /**
  * Zalo account management routes.
  * All endpoints require authentication via authMiddleware.
+ *
+ * ACL parity with socket layer (Fix #20): the socket subscribe path enforces
+ * org membership AND (owner/admin OR ownerUserId OR ZaloAccountAccess) before
+ * a user can join an account room. The REST surface here mirrors that:
+ *   - GET list: filtered to accessible accounts only (members don't see
+ *     accounts they have no business with)
+ *   - GET :id status: requireZaloAccess('read')
+ *   - POST create: requireRole(owner|admin) — creating accounts is an
+ *     organisational action, not something arbitrary members should trigger
+ *   - POST :id/login, POST :id/reconnect, DELETE :id: requireZaloAccess('admin')
+ *     — destructive/disruptive operations on the underlying Zalo session
  */
 import type { FastifyInstance } from 'fastify';
 import { authMiddleware } from '../auth/auth-middleware.js';
+import { requireRole } from '../auth/role-middleware.js';
+import { requireZaloAccess } from './zalo-access-middleware.js';
 import { zaloPool } from './zalo-pool.js';
 import { prisma } from '../../shared/database/prisma-client.js';
 
@@ -11,11 +24,32 @@ export async function zaloRoutes(app: FastifyInstance): Promise<void> {
   // All routes in this plugin require auth
   app.addHook('preHandler', authMiddleware);
 
-  // GET /api/v1/zalo-accounts — list accounts with live status from pool
+  // GET /api/v1/zalo-accounts — list accounts visible to caller.
+  // Owner/admin see every account in the org; members only see accounts they
+  // have an explicit ZaloAccountAccess row for OR own (ownerUserId match).
   app.get('/api/v1/zalo-accounts', async (request) => {
     const user = request.user!;
+
+    let where: any = { orgId: user.orgId };
+    if (user.role !== 'owner' && user.role !== 'admin') {
+      const accessRows = await prisma.zaloAccountAccess.findMany({
+        where: { userId: user.id },
+        select: { zaloAccountId: true },
+      });
+      const accessibleIds = accessRows.map((r) => r.zaloAccountId);
+      // Always include accounts the user owns (legacy accounts may lack
+      // explicit access rows — see Fix #15 ownerUserId fallback).
+      where = {
+        orgId: user.orgId,
+        OR: [
+          { id: { in: accessibleIds } },
+          { ownerUserId: user.id },
+        ],
+      };
+    }
+
     const accounts = await prisma.zaloAccount.findMany({
-      where: { orgId: user.orgId },
+      where,
       select: {
         id: true,
         zaloUid: true,
@@ -37,29 +71,49 @@ export async function zaloRoutes(app: FastifyInstance): Promise<void> {
     }));
   });
 
-  // POST /api/v1/zalo-accounts — create a new account record
+  // POST /api/v1/zalo-accounts — create a new account record.
+  // Restricted to owner/admin: provisioning a Zalo account ties up org-level
+  // resources and should not be a unilateral member action.
   app.post<{ Body: { displayName?: string } }>(
     '/api/v1/zalo-accounts',
+    { preHandler: requireRole('owner', 'admin') },
     async (request, reply) => {
       const user = request.user!;
       const { displayName } = request.body ?? {};
 
-      const account = await prisma.zaloAccount.create({
-        data: {
-          orgId: user.orgId,
-          ownerUserId: user.id,
-          displayName: displayName ?? null,
-          status: 'qr_pending',
-        },
+      // Atomic: create account + grant creator explicit ZaloAccountAccess so
+      // socket subscribe (which checks the access table) works immediately
+      // without falling back to the ownerUserId path. (Fix #15.)
+      const account = await prisma.$transaction(async (tx) => {
+        const created = await tx.zaloAccount.create({
+          data: {
+            orgId: user.orgId,
+            ownerUserId: user.id,
+            displayName: displayName ?? null,
+            status: 'qr_pending',
+          },
+        });
+        await tx.zaloAccountAccess.create({
+          data: {
+            zaloAccountId: created.id,
+            userId: user.id,
+            permission: 'admin',
+          },
+        });
+        return created;
       });
 
       return reply.status(201).send(account);
     },
   );
 
-  // POST /api/v1/zalo-accounts/:id/login — initiate QR login
+  // POST /api/v1/zalo-accounts/:id/login — initiate QR login.
+  // Disruptive: invalidates any active session on the account. Require admin
+  // permission on the specific account so members can't kick another team
+  // member's session.
   app.post<{ Params: { id: string } }>(
     '/api/v1/zalo-accounts/:id/login',
+    { preHandler: requireZaloAccess('admin') },
     async (request, reply) => {
       const { id } = request.params;
       const user = request.user!;
@@ -80,9 +134,11 @@ export async function zaloRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // POST /api/v1/zalo-accounts/:id/reconnect — force reconnect using saved session
+  // POST /api/v1/zalo-accounts/:id/reconnect — force reconnect using saved session.
+  // Same destructive-class as login; requires admin permission on the account.
   app.post<{ Params: { id: string } }>(
     '/api/v1/zalo-accounts/:id/reconnect',
+    { preHandler: requireZaloAccess('admin') },
     async (request, reply) => {
       const { id } = request.params;
       const user = request.user!;
@@ -111,9 +167,11 @@ export async function zaloRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // DELETE /api/v1/zalo-accounts/:id — disconnect and delete record
+  // DELETE /api/v1/zalo-accounts/:id — disconnect and delete record.
+  // Most destructive operation in this file → admin permission required.
   app.delete<{ Params: { id: string } }>(
     '/api/v1/zalo-accounts/:id',
+    { preHandler: requireZaloAccess('admin') },
     async (request, reply) => {
       const { id } = request.params;
       const user = request.user!;
@@ -132,9 +190,11 @@ export async function zaloRoutes(app: FastifyInstance): Promise<void> {
     },
   );
 
-  // GET /api/v1/zalo-accounts/:id/status — live status from pool
+  // GET /api/v1/zalo-accounts/:id/status — live status from pool.
+  // Read-only → minimum 'read' permission on the account.
   app.get<{ Params: { id: string } }>(
     '/api/v1/zalo-accounts/:id/status',
+    { preHandler: requireZaloAccess('read') },
     async (request, reply) => {
       const { id } = request.params;
       const user = request.user!;

@@ -34,6 +34,46 @@
       <!-- Messages -->
       <div ref="messagesContainer" class="flex-grow-1 overflow-y-auto pa-3 chat-messages-area">
         <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-2" />
+
+        <!-- History banner: top of the thread so "Tải thêm" is where users
+             expect it (native Zalo UX). Copy is deliberately conservative —
+             the backend SDK has no cursor for group history, so dedup
+             protects us but we cannot promise true pagination. -->
+        <div
+          v-if="showHistoryBanner"
+          class="history-banner"
+          :class="{ 'history-banner-exhausted': historyFullyExhausted }"
+        >
+          <v-progress-linear
+            v-if="loadingMore || fetchingHistory"
+            indeterminate
+            color="primary"
+            class="mb-1"
+            height="2"
+          />
+          <div class="d-flex align-center justify-center flex-column">
+            <v-btn
+              v-if="!historyFullyExhausted"
+              size="small"
+              variant="tonal"
+              color="primary"
+              :loading="loadingMore || fetchingHistory"
+              :disabled="loadingMore || fetchingHistory"
+              prepend-icon="mdi-arrow-up"
+              @click="onLoadMoreClick"
+            >
+              {{ loadMoreButtonLabel }}
+            </v-btn>
+            <span v-else class="text-caption text-grey-darken-1">
+              <v-icon icon="mdi-check-circle-outline" size="14" class="mr-1" />
+              Đã tải hết lịch sử khả dụng
+            </span>
+            <div v-if="bannerHint" class="text-caption text-grey mt-1">
+              {{ bannerHint }}
+            </div>
+          </div>
+        </div>
+
         <div v-for="msg in messages" :key="msg.id" class="mb-2 d-flex" :class="msg.senderType === 'self' ? 'justify-end' : 'justify-start'">
           <div style="max-width: 70%;">
             <div v-if="conversation.threadType === 'group' && msg.senderType !== 'self'" class="text-caption mb-1" style="color: #00F2FF; font-weight: 500;">
@@ -174,9 +214,27 @@ const props = defineProps<{
   aiSuggestion: string;
   aiSuggestionLoading: boolean;
   aiSuggestionError: string;
+  /** Total message count reported by the server on the last full fetch. Used
+   *  to decide whether we can still cursor-load from the DB. */
+  totalMessages?: number;
+  /** In-flight flags driven by the parent composable. */
+  loadingMore?: boolean;
+  fetchingHistory?: boolean;
+  /** True when the last cursor fetch returned hasMore=false. */
+  localHistoryExhausted?: boolean;
+  /** Last known value of the server-reported `moreUpstream` flag from
+   *  fetch-history. Lets the banner say "Zalo còn lịch sử cũ hơn" vs
+   *  "Zalo đã hết" without lying about SDK cursor limitations. */
+  lastMoreUpstream?: boolean | null;
 }>();
 
-const emit = defineEmits<{ send: [content: string]; 'toggle-contact-panel': []; 'ask-ai': [] }>();
+const emit = defineEmits<{
+  send: [content: string];
+  'toggle-contact-panel': [];
+  'ask-ai': [];
+  'load-more-local': [];
+  'fetch-history': [];
+}>();
 
 const inputText = ref('');
 const messagesContainer = ref<HTMLElement | null>(null);
@@ -348,7 +406,115 @@ async function syncAppointment(msg: Message) {
   }
 }
 
-watch(() => props.messages.length, async () => { await nextTick(); if (messagesContainer.value) messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight; });
+// ── History banner logic ──────────────────────────────────────────────────
+// We distinguish three exhaustion sources so the copy is honest:
+//   - Local DB: cursor pagination on the Message table (authoritative: when
+//     the server returns hasMore=false there really is nothing older in DB)
+//   - Zalo SDK group history: lacks a cursor — getGroupChatHistory only takes
+//     `count` and may re-fetch the newest window. We only mark it exhausted
+//     when the upstream explicitly reports more=false (Fix #5 round 2).
+//   - User (1-1) threads: P5 R&D deferred, so we can't fetch history from
+//     Zalo at all yet. Banner hides the "Lấy từ Zalo" path for these.
+const canLoadMoreLocal = computed(() => {
+  if (!props.conversation || props.messages.length === 0) return false;
+  if (props.localHistoryExhausted) return false;
+  const total = props.totalMessages ?? 0;
+  return total > props.messages.length;
+});
+
+const canFetchZaloHistory = computed(() => {
+  if (!props.conversation) return false;
+  if (props.conversation.threadType !== 'group') return false;
+  return props.conversation.historyExhausted !== true;
+});
+
+const historyFullyExhausted = computed(
+  () => !canLoadMoreLocal.value && !canFetchZaloHistory.value,
+);
+
+const showHistoryBanner = computed(() => {
+  if (!props.conversation) return false;
+  // Don't render the banner while the initial page is still loading — the
+  // exhaustion flags aren't meaningful until the first fetch settles.
+  if (props.loading) return false;
+  if (props.messages.length === 0) return false;
+  return canLoadMoreLocal.value || canFetchZaloHistory.value || historyFullyExhausted.value;
+});
+
+const loadMoreButtonLabel = computed(() => {
+  if (props.loadingMore) return 'Đang tải tin cũ…';
+  if (props.fetchingHistory) return 'Đang gọi Zalo…';
+  if (canLoadMoreLocal.value) return 'Tải thêm tin cũ (CRM)';
+  if (canFetchZaloHistory.value) return 'Lấy thêm tin từ Zalo';
+  return 'Không còn tin cũ';
+});
+
+const bannerHint = computed(() => {
+  if (canLoadMoreLocal.value) return '';
+  if (canFetchZaloHistory.value) {
+    // When moreUpstream is explicitly false we know Zalo itself says no
+    // more; we still allow a retry because `historyExhausted` gets set
+    // conservatively (only on added=0 && more=false) per Fix #5.
+    if (props.lastMoreUpstream === false) {
+      return 'Zalo báo không còn lịch sử cũ hơn — nhấn để thử lại.';
+    }
+    return 'Zalo chỉ trả cửa sổ gần đây nhất; tin đã lưu sẽ được bỏ qua.';
+  }
+  if (props.conversation?.threadType === 'user') {
+    return 'Hội thoại 1-1 chưa hỗ trợ lấy lịch sử cũ (đang R&D).';
+  }
+  return '';
+});
+
+function onLoadMoreClick() {
+  if (props.loadingMore || props.fetchingHistory) return;
+  if (canLoadMoreLocal.value) {
+    captureScrollBeforePrepend();
+    emit('load-more-local');
+  } else if (canFetchZaloHistory.value) {
+    captureScrollBeforePrepend();
+    emit('fetch-history');
+  }
+}
+
+// ── Scroll preservation for prepend vs append ────────────────────────────
+// Without this, the simple `length` watcher would auto-scroll to bottom
+// every time we prepend old messages, jarring the user back to the newest
+// message and defeating the "Tải thêm" flow.
+let prevFirstId: string | null = null;
+let savedScrollHeight = 0;
+function captureScrollBeforePrepend() {
+  const el = messagesContainer.value;
+  if (el) savedScrollHeight = el.scrollHeight;
+}
+
+watch(
+  () => props.messages.map((m) => m.id),
+  async (newIds, oldIds) => {
+    await nextTick();
+    const el = messagesContainer.value;
+    if (!el) return;
+    const currentFirstId = newIds[0] ?? null;
+    const currentLen = newIds.length;
+    const prevLen = oldIds?.length ?? 0;
+    // Prepend = length grew AND the first id changed (old first still exists
+    // inside newIds). Covers cursor load-more + fetch-history refetch cases.
+    const prepended =
+      prevFirstId !== null &&
+      currentFirstId !== prevFirstId &&
+      currentLen > prevLen &&
+      newIds.includes(prevFirstId);
+    if (prepended && savedScrollHeight > 0) {
+      el.scrollTop += el.scrollHeight - savedScrollHeight;
+    } else {
+      // Append / initial load / conversation switch → scroll to newest
+      el.scrollTop = el.scrollHeight;
+    }
+    prevFirstId = currentFirstId;
+    savedScrollHeight = 0;
+  },
+  { flush: 'post' },
+);
 </script>
 
 <style scoped>
@@ -357,4 +523,16 @@ watch(() => props.messages.length, async () => { await nextTick(); if (messagesC
 .file-card { display: flex; align-items: center; padding: 8px 12px; border-radius: 8px; background: rgba(0, 242, 255, 0.05); border: 1px solid rgba(0, 242, 255, 0.1); }
 .chat-image { max-width: 100%; max-height: 300px; border-radius: 12px; cursor: pointer; transition: transform 0.2s; }
 .chat-image:hover { transform: scale(1.02); }
+.history-banner {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  background: rgba(0, 242, 255, 0.04);
+  border: 1px dashed rgba(0, 242, 255, 0.15);
+  text-align: center;
+}
+.history-banner-exhausted {
+  background: transparent;
+  border: none;
+}
 </style>

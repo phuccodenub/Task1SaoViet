@@ -4,14 +4,20 @@
     <!-- Conversation list — resizable -->
     <div class="chat-panel-left" :style="{ width: leftWidth + 'px' }">
       <ConversationList
+        ref="conversationListRef"
         :conversations="conversations"
         :selected-id="selectedConvId"
         :loading="loadingConvs"
+        :approving-id="approvingConv"
+        :rejecting-id="rejectingConv"
+        :external-counts="counts"
         v-model:search="searchQuery"
         @select="selectConversation"
         @filter-account="onFilterAccount"
         @update:filters="onFiltersUpdate"
         @conversation-moved="onConversationMoved"
+        @approve="onApprove"
+        @reject="onReject"
       />
       <!-- Resize handle -->
       <div class="resize-handle" @mousedown="startResize('left', $event)" />
@@ -26,9 +32,16 @@
       :ai-suggestion="aiSuggestion"
       :ai-suggestion-loading="aiSuggestionLoading"
       :ai-suggestion-error="aiSuggestionError"
+      :total-messages="totalMessages"
+      :loading-more="loadingMore"
+      :fetching-history="fetchingHistory"
+      :local-history-exhausted="localHistoryExhausted"
+      :last-more-upstream="lastMoreUpstream"
       @send="sendMessage"
       @ask-ai="generateAiSuggestion"
       @toggle-contact-panel="showContactPanel = !showContactPanel"
+      @load-more-local="loadMoreLocal"
+      @fetch-history="fetchHistoryFromZalo"
       :show-contact-panel="showContactPanel"
       style="flex: 1; min-width: 300px;"
     />
@@ -68,23 +81,43 @@ const {
   loadingConvs, loadingMsgs, sendingMsg, searchQuery, accountFilter, extraFilters,
   aiSuggestion, aiSuggestionLoading, aiSuggestionError,
   aiSummary, aiSummaryLoading, aiSentiment, aiSentimentLoading,
+  totalMessages, localHistoryExhausted, lastMoreUpstream,
+  loadingMore, fetchingHistory, approvingConv, rejectingConv,
+  counts,
   fetchConversations, fetchAiConfig, selectConversation, sendMessage,
   generateAiSuggestion, generateAiSummary, generateAiSentiment,
-  initSocket, destroySocket,
+  initSocket, destroySocket, fetchCounts,
+  loadMoreLocal, fetchHistoryFromZalo, approveConv, rejectConv,
 } = useChat();
+
+const conversationListRef = ref<InstanceType<typeof ConversationList> | null>(null);
 
 function onFilterAccount(id: string | null) {
   accountFilter.value = id;
   fetchConversations();
+  fetchCounts();
 }
 
 function onFiltersUpdate(params: Record<string, string>) {
   extraFilters.value = params;
   fetchConversations();
+  fetchCounts();
 }
 
 function onConversationMoved(_id: string, _tab: string) {
   fetchConversations();
+}
+
+async function onApprove(convId: string) {
+  await approveConv(convId);
+  // Refresh the embedded counts in the ConversationList badge too so the
+  // pending tab disappears when count hits zero.
+  conversationListRef.value?.fetchCounts?.();
+}
+
+async function onReject(convId: string) {
+  await rejectConv(convId);
+  conversationListRef.value?.fetchCounts?.();
 }
 
 const showContactPanel = ref(false);
@@ -130,7 +163,12 @@ function stopResize() {
 }
 
 onMounted(() => {
-  if (!isMobile.value) { fetchConversations(); fetchAiConfig(); initSocket(); }
+  if (!isMobile.value) {
+    fetchConversations();
+    fetchAiConfig();
+    fetchCounts();
+    initSocket();
+  }
 });
 onUnmounted(() => {
   if (!isMobile.value) { destroySocket(); }

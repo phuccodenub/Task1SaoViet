@@ -39,6 +39,12 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    path: '/zalo-accounts/:id/allowlist',
+    name: 'ZaloAllowlist',
+    component: () => import('@/views/ZaloAllowlistView.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/appointments',
     name: 'Appointments',
     component: () => import('@/views/AppointmentsView.vue'),

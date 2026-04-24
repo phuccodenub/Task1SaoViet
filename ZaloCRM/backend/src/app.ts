@@ -30,6 +30,8 @@ import { teamRoutes } from './modules/auth/team-routes.js';
 import { orgRoutes } from './modules/auth/org-routes.js';
 import { zaloAccessRoutes } from './modules/zalo/zalo-access-routes.js';
 import { zaloSyncRoutes } from './modules/zalo/zalo-sync-routes.js';
+import { zaloAllowlistRoutes } from './modules/zalo/zalo-allowlist-routes.js';
+import { zaloHistoryRoutes } from './modules/zalo/zalo-history-routes.js';
 import { zaloPool } from './modules/zalo/zalo-pool.js';
 import { registerZaloSocketHandlers } from './modules/zalo/zalo-socket.js';
 import { notificationRoutes } from './modules/notifications/notification-routes.js';
@@ -91,15 +93,10 @@ async function bootstrap() {
   // Pass io to zalo pool for real-time event emission
   zaloPool.setIO(io);
 
-  io.on('connection', (socket) => {
-    logger.info(`Socket connected: ${socket.id}`);
-    socket.on('disconnect', () => {
-      logger.debug(`Socket disconnected: ${socket.id}`);
-    });
-  });
-
-  // Register Zalo Socket.IO event handlers
-  registerZaloSocketHandlers(io);
+  // Register Zalo Socket.IO event handlers — installs JWT auth middleware
+  // and the single connection handler. Must be called BEFORE any other
+  // io.on('connection', ...) so authentication runs first.
+  registerZaloSocketHandlers(io, app);
 
   // ── Routes ────────────────────────────────────────────────────────────────
 
@@ -116,6 +113,8 @@ async function bootstrap() {
   await app.register(orgRoutes);
   await app.register(zaloAccessRoutes);
   await app.register(zaloSyncRoutes);
+  await app.register(zaloAllowlistRoutes);
+  await app.register(zaloHistoryRoutes);
   await app.register(notificationRoutes);
   await app.register(searchRoutes);
   await app.register(publicApiRoutes);

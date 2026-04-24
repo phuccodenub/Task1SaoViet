@@ -31,10 +31,9 @@ export async function sendTemplateAction(input: {
   const instance = zaloPool.getInstance(input.zaloAccountId);
   if (!instance?.api) return null;
 
-  const limits = zaloRateLimiter.checkLimits(input.zaloAccountId);
+  const limits = await zaloRateLimiter.reserveSend(input.zaloAccountId);
   if (!limits.allowed) return null;
 
-  zaloRateLimiter.recordSend(input.zaloAccountId);
   const threadType = input.threadType === 'group' ? 1 : 0;
   const sendResult = await instance.api.sendMessage({ msg: content }, input.threadId, threadType);
   const zaloMsgId = String(sendResult?.msgId || sendResult?.data?.msgId || '');

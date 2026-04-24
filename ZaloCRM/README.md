@@ -1,4 +1,4 @@
-# ZaloCRM v2.1 — Quản lý nhiều tài khoản Zalo cá nhân
+# ZaloCRM v2.2 — Quản lý nhiều tài khoản Zalo cá nhân
 
 Hệ thống quản lý tập trung nhiều tài khoản Zalo cá nhân trên 1 giao diện web. Chat real-time, AI assistant, workflow tự động, tích hợp đa nền tảng, analytics nâng cao, PWA mobile.
 
@@ -20,6 +20,14 @@ Hệ thống quản lý tập trung nhiều tài khoản Zalo cá nhân trên 1 
 - **Thông báo** — Tin chưa trả lời >30 phút, lịch hẹn sắp tới, Zalo mất kết nối
 - **Tìm kiếm toàn hệ thống** — Tìm khách hàng, tin nhắn, lịch hẹn
 - **Giao diện** — Theme tối/sáng, thiết kế Liquid Silicon
+
+### Mới trong v2.2
+
+- **Allowlist hội thoại** — Chọn hội thoại nào sync vào CRM thay vì ingest toàn bộ; tin từ hội thoại chưa chọn nằm ở tab "Chờ duyệt" để sale kiểm tra trước. Backend có ACL đầy đủ (REST/Socket/Public API), webhook + automation bị gate theo `visibility`. Xem [docs/feature-conversation-allowlist.md](docs/feature-conversation-allowlist.md).
+- **Wizard sau QR login** — Dialog 3-bước tự mở cho account mới, đăng ký per-account một lần; user có thể mở lại thủ công trong trang Tài khoản Zalo.
+- **Tải lịch sử chat cũ** — Banner "Tải thêm" ở đầu khung chat với 2 path: cursor trên Message table (CRM-local, luôn an toàn) + gọi Zalo SDK cho group. UX copy trung thực về giới hạn SDK (không có cursor group upstream). Chat 1-1 R&D ở PR riêng với feature flag. Xem [docs/feature-chat-history-fetch.md](docs/feature-chat-history-fetch.md).
+- **Bảo mật allowlist end-to-end** — JWT socket auth, `account:<id>` room ACL, pending envelope scrub (không leak metadata cross-account), cascade flip visible→hidden khi untick. 9 rounds Codex audit hardening.
+- **Migration an toàn** — Default `ingestPolicy='all'` giữ hành vi v2.1; user bật allowlist per-account chủ động. Xem [ADR-001](backend/docs/adr-001-default-ingest-policy.md) + [hướng dẫn migration](docs/migration-v2.1-to-v2.2.md).
 
 ### Mới trong v2.1
 
@@ -110,6 +118,14 @@ Header: X-API-Key: your-api-key
 | `zalo.disconnected` | Zalo mất kết nối |
 
 ## Lịch sử phiên bản
+
+### v2.2 (23/04/2026)
+- Allowlist hội thoại: chọn hội thoại nào sync vào CRM, visibility lifecycle visible/pending/hidden
+- Wizard cài đặt hội thoại sau QR login (per-account, một lần)
+- Tải lịch sử chat cũ (cursor local + Zalo SDK cho group, UX trung thực về giới hạn SDK)
+- JWT socket auth, account-room ACL parity REST/Socket/Public API
+- ADR-001: default `ingestPolicy='all'` để giữ backward-compat v2.1
+- Contract smoke test shell (12 assertions, body-level + live-send guard)
 
 ### v2.1 (16/04/2026)
 - Tab "Khác": ẩn hội thoại không quan trọng, chuyển tab bằng chuột phải
